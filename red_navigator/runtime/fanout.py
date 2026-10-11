@@ -7,6 +7,11 @@ Module-level plugin registry plus no-op-when-empty :func:`journal_entry`
 (``publish``). Every plugin exception is logged, never raised, so a
 broken plugin can never stall the NOVA monitor threads.
 
+Delivery is copy-on-dispatch: each plugin receives its own shallow
+copy of the entry/data/state dicts, so a mutating (or hostile) plugin
+can neither corrupt the caller's dict (e.g. NOVA's live journal event)
+nor affect what later plugins see.
+
 The enabled flag is flipped by :mod:`red_navigator.runtime.session`:
 the ``ed_monitor`` hooks check :func:`is_enabled` before calling in, so
 upstream behavior is byte-identical when no RED session runs. Direct
@@ -97,8 +102,9 @@ def journal_entry(entry: dict, ctx: dict) -> None:
 
     ``ctx`` carries ``cmdr``/``is_beta``/``system``/``station``/``state``
     (all optional; missing keys fall back to EDMC-neutral defaults) and
-    an optional ``in_cqc`` flag routing to ``journal_entry_cqc``. Never
-    raises.
+    an optional ``in_cqc`` flag routing to ``journal_entry_cqc``. Each
+    plugin gets its own copy of ``entry``/``state``; the caller's dicts
+    are never altered. Never raises.
     """
     try:
         if not isinstance(entry, dict):
@@ -141,9 +147,9 @@ def journal_entry(entry: dict, ctx: dict) -> None:
         for plugin in _targets():
             try:
                 loader.dispatch_entry(
-                    plugin, entry,
+                    plugin, dict(entry),
                     in_cqc=in_cqc, cmdr=cmdr, is_beta=is_beta,
-                    system=system, station=station, state=state,
+                    system=system, station=station, state=dict(state),
                 )
             except Exception:
                 _log.exception("journal_entry fan-out failed for %r", plugin)
@@ -162,7 +168,8 @@ def dashboard_entry(data: dict) -> None:
     """Fan out one parsed Status.json ``data`` dict + overlay publish.
 
     Commander context comes from the last journal call (dashboard feed
-    carries no cmdr). Never raises.
+    carries no cmdr). Each plugin gets its own copy of ``data``; the
+    caller's dict is never altered. Never raises.
     """
     try:
         if not isinstance(data, dict):
@@ -176,7 +183,7 @@ def dashboard_entry(data: dict) -> None:
 
         for plugin in _targets():
             try:
-                loader.call_dashboard(plugin, cmdr, is_beta, data)
+                loader.call_dashboard(plugin, cmdr, is_beta, dict(data))
             except Exception:
                 _log.exception("dashboard_entry fan-out failed for %r", plugin)
 
