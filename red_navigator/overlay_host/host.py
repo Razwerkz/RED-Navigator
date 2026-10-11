@@ -387,7 +387,9 @@ def publish(payload: dict) -> bool:
         if callable(fn):
             try:
                 result = fn(dict(payload))
-                return bool(result) if isinstance(result, bool) else True
+                # Real-overlay None-means-success: no-return plugins report
+                # success; otherwise honor the plugin's truthy/falsy verdict.
+                return True if result is None else bool(result)
             except Exception:
                 continue
     broadcaster = getattr(plugin, "broadcaster", None)

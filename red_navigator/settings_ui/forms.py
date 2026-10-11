@@ -128,6 +128,8 @@ def render(prefs_spec: dict | list | None, *, plugin: str | None = None) -> list
                 if default is None:
                     default = False if field_type == "bool" else (
                         0 if field_type == "number" else "")
+                if field_type == "number" and isinstance(default, bool):
+                    default = int(default)
                 label = field.get("label", key)
                 if not isinstance(label, str) or not label:
                     label = key

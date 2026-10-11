@@ -250,7 +250,7 @@ def format_report(
         f"baseline: cpu={cpu_limit:.1f}% rss={rss_limit:.1f} MiB "
         f"(EDMC-plus-plugins ceiling; source: {source})",
     ]
-    if source == PLACEHOLDER_SOURCE:
+    if str(source).startswith(PLACEHOLDER_SOURCE):
         lines.append(
             "WARNING: baseline is an UNCALIBRATED placeholder, not a measured "
             "game-running EDMC stack — calibrate via --baseline-file from a "
