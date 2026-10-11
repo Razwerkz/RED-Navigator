@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import json
 import logging
-import socket
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -40,12 +39,6 @@ REUSED_FILES = (
     "overlay_groupings.user.json",
     "overlay_settings.json",
 )
-
-
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
 
 
 def _broadcaster_port(candidate: Any) -> int:
@@ -82,7 +75,13 @@ def _discover_port(plugin: Any, plugin_dir: Path) -> int:
     try:
         data = json.loads((plugin_dir / "port.json").read_text(encoding="utf-8"))
         return int(data.get("port", 0) or 0)
-    except (OSError, ValueError, AttributeError):
+    except (OSError, ValueError, AttributeError, TypeError):
+        # Corrupt/unexpected port.json (e.g. {"port": []}, a JSON list,
+        # or malformed text) means "unknown", never a crash: returning 0
+        # lets start() fall through to port_owner.claim's stale-file
+        # cleanup instead of dying before it. JSONDecodeError is a
+        # ValueError subclass, listed here via ValueError; TypeError covers
+        # int() on non-numeric types.
         return 0
 
 
@@ -179,6 +178,11 @@ def start(plugin_dir: str) -> int:
     Loads the unmodified ``load.py`` via the Task 2 loader, starts its
     broadcaster and legacy TCP path, launches/supervises its existing
     client/controller processes, and returns the broadcaster port.
+
+    Returns ``0`` when no broadcast transport is available: an unbound
+    port is never written to ``port.json`` nor returned, so discovery
+    and the 1:1 parity contract only ever see a verified-listening or
+    live-shared port.
     """
     global _plugin, _plugin_dir, _port
     from red_navigator.edmc_compat import loader
@@ -194,25 +198,11 @@ def start(plugin_dir: str) -> int:
     plugin = loader.load_plugin(str(directory))
     _verify_reused_files(directory)
 
-    # Start via the loader's hook helper (keeps hook-error semantics 1:1
-    # with EDMC). Capture a raw int return as a port for test doubles.
-    raw_port = 0
-    try:
-        start_fn = getattr(plugin, "plugin_start3", None)
-        if callable(start_fn):
-            raw = start_fn(str(directory))
-            if isinstance(raw, int) and 0 < raw < 65536:
-                raw_port = raw
-        else:
-            loader.call_plugin_start3(plugin, str(directory))
-    except Exception:
-        _log.exception("plugin_start3 failed for %s", directory)
-    # Mirror the loader helper path for plugins without plugin_start3.
-    if getattr(plugin, "plugin_start3", None) is None:
-        try:
-            loader.call_plugin_start3(plugin, str(directory))
-        except Exception:
-            _log.exception("plugin_start3 fallback failed for %s", directory)
+    # Single start call routed through the loader's hook helper, so
+    # hook-error semantics stay 1:1 with EDMC (the helper contains hook
+    # exceptions and falls back to the directory name). Exactly one call
+    # in all cases: hook-less plugins are handled inside the helper.
+    loader.call_plugin_start3(plugin, str(directory))
 
     runtime = getattr(plugin, "_plugin", None)
     port = 0
@@ -222,12 +212,17 @@ def start(plugin_dir: str) -> int:
     if not port:
         port = _discover_port(plugin, directory)
     if not port:
-        port = raw_port
-    if not port:
-        # Degraded mode (client env missing in headless setups): claim a
-        # host-owned port so callers still get a usable broadcaster port.
-        port = _free_port()
-        _log.warning("Overlay broadcaster unavailable; claimed fallback port %d", port)
+        # No broadcast transport (broadcaster down and nothing
+        # discoverable). Never invent an unbound port: leave any existing
+        # port.json alone — a live owner's file must survive, and a stale
+        # one is port_owner.claim's job on the next successful start.
+        _log.warning("Overlay broadcaster unavailable for %s; returning 0", directory)
+        with _lock:
+            _plugin = plugin
+            _plugin_dir = str(directory)
+            _port = 0
+            _ensure_supervisor()
+            return 0
 
     try:
         if not port_owner.claim(str(directory), port):
@@ -236,7 +231,7 @@ def start(plugin_dir: str) -> int:
             try:
                 data = json.loads((directory / "port.json").read_text(encoding="utf-8"))
                 port = int(data.get("port", port) or port)
-            except (OSError, ValueError):
+            except (OSError, ValueError, AttributeError, TypeError):
                 pass
             _log.info("port.json owned by a live process; sharing port %d", port)
     except Exception:
@@ -315,7 +310,9 @@ def publish(payload: dict) -> bool:
     Task 2 journal hook so grouping/profile state stays in sync
     (:func:`monitor.game_running` is consulted for parity logging, but
     the broadcast is never dropped because of game state). Returns True
-    when handed off.
+    only when a broadcast transport accepted the payload, False
+    otherwise (journal forwarding may still have occurred; the mirror
+    renders the payload regardless of the return value).
     """
     from red_navigator.edmc_compat import loader, monitor
 
@@ -401,15 +398,11 @@ def publish(payload: dict) -> bool:
             return True
         except Exception:
             return False
-    # Degraded mode: plugin loaded but transport missing. The payload is
-    # still JSON-serialisable and mirrorable; report success so callers
-    # (and the terminal mirror) treat it as handed off.
-    try:
-        json.dumps(payload)
-    except (TypeError, ValueError):
-        return False
-    _log.debug("Publish handed off in degraded mode (no broadcaster)")
-    return True
+    # No broadcast transport accepted the payload: report failure.
+    # The terminal mirror renders the payload regardless of this return
+    # value, so a False here never hides terminal output.
+    _log.debug("No overlay transport accepted payload; reporting failure")
+    return False
 
 
 def last_port() -> int:
