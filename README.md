@@ -28,7 +28,8 @@ Requirements: **Python 3.11+**, Linux (v1 is Linux-only; the game is
 expected via Proton/Steam).
 
 ```bash
-# from the repo root
+git clone https://github.com/Razwerkz/RED-Navigator
+cd RED-Navigator
 .venv/bin/python -m red_navigator.app
 ```
 
@@ -42,10 +43,12 @@ Useful flags:
 
 What happens on launch:
 
-1. The plugin dir defaults to the Proton EDMC install
+1. The plugin dir defaults to the first existing Proton EDMC path
    (`compatdata/359320/.../AppData/Local/EDMarketConnector/plugins/`,
-   probed across Steam library roots, with the native
-   `~/.config/EDMarketConnector` as fallback).
+   probed across Steam library roots, else the canonical Proton path),
+   overridable via `--plugin-dir`. Separately, the EDMC data import
+   source falls back to the native `~/.config/EDMarketConnector` when
+   the Proton data dir is absent.
 2. On first run with no RED data present, settings are imported from
    your EDMC data dir. If the import fails you are asked whether to
    retry or start fresh — it never proceeds silently.
@@ -89,10 +92,10 @@ via `RED_NAVIGATOR_JOURNAL_DIR`.
   `s`-key settings overlay. Values persist across restarts and survive
   plugin updates that add new keys.
 - **Runtime bridge** (`red_navigator/runtime/` + `feeds/`): journal and
-  Status.json feeds are fanned out to all loaded plugins with
-  copy-on-dispatch (a misbehaving plugin can never corrupt the live
-  event or stall the monitor threads). Broken plugins are skipped with
-  a log; overlay failure degrades to terminal-only, never a crash.
+  Status.json feeds are fanned out to all loaded plugins;
+  shallow copy-on-dispatch isolates top-level event dicts per plugin
+  and plugin exceptions are logged, never raised. Broken plugins are
+  skipped with a log; overlay failure degrades to terminal-only, never a crash.
 
 ## NOVA base (unchanged)
 
