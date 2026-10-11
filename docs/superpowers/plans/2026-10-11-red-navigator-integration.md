@@ -44,7 +44,7 @@
 
 **Interfaces:**
 - Consumes: `loader.discover_plugins/discover+load_plugin/call_plugin_start3/call_journal/dispatch_entry/call_dashboard/call_plugin_stop` and `monitor` from `red_navigator/edmc_compat`, `host.start/publish/stop` from `red_navigator/overlay_host`, `mount_loaded` from `red_navigator/settings_ui/host_panel`, `importer` + `config_store.set_store_path/load` from `red_navigator/edmc_compat`.
-- Produces: `session.start(plugin_dir: str, red_store: str, *, overlay: bool = True) -> Session`, `session.stop(s: Session) -> None`, `fanout.journal_entry(entry: dict, ctx: dict) -> None`, `fanout.dashboard_entry(data: dict) -> None`, `Session.is_running() -> bool`.
+- Produces: `session.start(plugin_dir: str, red_store: str, *, overlay: bool = True) -> Session`, `session.stop(s: Session) -> None`, `fanout.journal_entry(entry: dict, ctx: dict) -> None`, `fanout.dashboard_entry(data: dict) -> None`, `fanout.register_test_plugin(p: Any) -> None`, `fanout.clear_test_plugins() -> None`, `Session.is_running() -> bool`.
 
 - [ ] **Step 1: Write the failing test**
 
