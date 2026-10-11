@@ -48,7 +48,7 @@ Repository = "https://github.com/KernicDE/nova-ed-monitor"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["ed_monitor*"]
+include = ["ed_monitor*", "red_navigator*"]
 
 [tool.setuptools.package-data]
 "ed_monitor" = ["voicelines/*.toml", "personality/*.toml", "config.toml.example", "themes/*.toml", "themes/README.md"]
