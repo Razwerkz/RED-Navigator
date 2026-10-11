@@ -95,3 +95,50 @@ def test_settings_sections_exposes_hook_path_and_panels():
     assert sections["hook"] == "ed_monitor.ui.app:NovaApp.on_key[s]->SettingsScreen"
     assert "SettingsScreen" in sections["hook"]
     assert [p["name"] for p in sections["panels"]] == ["Alpha"]
+
+
+def test_spec_less_plugin_with_prefs_renders_placeholder():
+    from red_navigator.settings_ui import host_panel
+
+    class RawTkPlugin:
+        def plugin_prefs(self, parent, cmdr, is_beta):
+            return parent
+
+    host_panel.register_plugin("RawTk", RawTkPlugin())
+    host_panel.mount_for_plugin("RawTk")
+    panel = host_panel.get_panel("RawTk")
+    assert panel["has_prefs"] is True
+    assert len(panel["fields"]) == 1
+    field = panel["fields"][0]
+    assert field.get("placeholder") is True
+    assert "RawTk" in field["hint"]
+    assert "prefs_spec" in field["hint"]
+    assert "RawTk" in field["value"]
+
+
+def test_placeholder_is_never_persisted_and_wipes_nothing():
+    from red_navigator.edmc_compat import config_store
+    from red_navigator.settings_ui import host_panel
+
+    class RawTkPlugin:
+        def plugin_prefs(self, parent, cmdr, is_beta):
+            return parent
+
+    host_panel.register_plugin("RawTk", RawTkPlugin())
+    host_panel.mount_for_plugin("RawTk")
+    config_store.set("real_key", "keep", plugin="RawTk")
+    placeholder_key = host_panel.get_panel("RawTk")["fields"][0]["key"]
+    host_panel.save_panel_values("RawTk", {placeholder_key: "junk", "other": "v"})
+    assert config_store.get_str(placeholder_key, plugin="RawTk") is None
+    assert config_store.get_str("other", plugin="RawTk") == "v"
+    assert config_store.get_str("real_key", plugin="RawTk") == "keep"
+    # Placeholder survives the post-save refresh (still no hollow panel).
+    assert host_panel.get_panel("RawTk")["fields"][0].get("placeholder") is True
+
+
+def test_plugin_without_prefs_and_without_spec_has_no_fields():
+    from red_navigator.settings_ui import host_panel
+    host_panel.mount_for_plugin("Bare")
+    panel = host_panel.get_panel("Bare")
+    assert panel["has_prefs"] is False
+    assert panel["fields"] == []

@@ -7,6 +7,17 @@ intentionally read-only towards ``ed_monitor/``: it keeps one panel per
 loaded plugin exposing ``plugin_prefs``/``prefs_changed`` — listed by the
 name returned from ``plugin_start3`` — and exposes them via
 :func:`settings_sections` for the settings overlay to draw.
+
+Adaptor contract (for the loader/adaptor task): a plugin's tkinter
+``plugin_prefs(parent, cmdr, is_beta)`` callable cannot be introspected
+headless, so a plugin (or its adaptor) supplies a plain-data prefs spec
+consumed by :mod:`red_navigator.settings_ui.forms` — either a
+``prefs_spec`` attribute (``{"fields": [{key, type, default, label?,
+options?, ...}]}``) or a ``get_prefs_spec()`` callable returning one.
+When a plugin exposes ``plugin_prefs`` but supplies no such spec, the
+panel renders a single explanatory placeholder field (see
+:func:`mount_for_plugin`) instead of a silently empty panel, so the UI
+never lists hollow panels.
 """
 
 from __future__ import annotations
@@ -33,6 +44,57 @@ _panels: dict[str, dict[str, Any]] = {}
 
 #: Loaded plugin objects keyed by display name (for prefs_changed calls).
 _registry: dict[str, Any] = {}
+
+#: Field key for the explanatory placeholder rendered when a plugin
+#: exposes ``plugin_prefs`` but supplies no RED-side prefs spec. The key
+#: is namespaced like any other setting but is stripped from saves (see
+#: :func:`save_panel_values`), so it is never persisted and never wipes
+#: real settings.
+_PLACEHOLDER_KEY = "_prefs_no_spec"
+
+
+def _placeholder_field(name: str) -> dict[str, Any]:
+    """Build the explanatory placeholder field for spec-less ``name``."""
+    text = (
+        f"Settings for '{name}' are defined by its tkinter plugin_prefs "
+        "panel, which has no RED prefs_spec adaptor yet "
+        "(provide a prefs_spec attribute or get_prefs_spec() callable); "
+        "plugin defaults apply."
+    )
+    return {
+        "key": _PLACEHOLDER_KEY,
+        "type": "text",
+        "label": f"{name} settings",
+        "value": text,
+        "default": "",
+        "placeholder": True,
+        "hint": (
+            f"No RED-side prefs spec for '{name}': adaptor contract is a "
+            "'prefs_spec' attribute or 'get_prefs_spec()' callable "
+            "returning {'fields': [...]}."
+        ),
+    }
+
+
+def _build_fields(name: str, plugin: Any, has_prefs: bool) -> list[dict[str, Any]]:
+    """Render ``plugin``'s fields, or a placeholder when spec-less.
+
+    Returns ``forms.render`` output when a RED-side spec exists (even if
+    it renders to an empty list), a single explanatory placeholder field
+    when the plugin exposes ``plugin_prefs`` but supplies no spec, and an
+    empty list otherwise. Never raises.
+    """
+    try:
+        with config_store.scoped(name):
+            spec = _prefs_spec_of(plugin)
+            if spec is None:
+                if has_prefs:
+                    return [_placeholder_field(name)]
+                return []
+            return forms.render(spec, plugin=name)
+    except Exception:
+        _log.debug("Panel render failed for %r", name, exc_info=True)
+        return []
 
 
 def _prefs_spec_of(plugin: Any) -> dict | list | None:
@@ -66,7 +128,9 @@ def mount_for_plugin(name: str) -> None:
 
     Idempotent: mounting twice keeps a single panel. Never raises —
     unknown plugins mount as panels with no fields so the settings
-    overlay still lists them.
+    overlay still lists them. Plugins exposing ``plugin_prefs`` without
+    a RED-side prefs spec (see the module adaptor contract) mount with a
+    single explanatory placeholder field instead of a hollow panel.
     """
     if not isinstance(name, str) or not name:
         return
@@ -74,12 +138,7 @@ def mount_for_plugin(name: str) -> None:
         plugin = _registry.get(name)
         has_prefs = callable(getattr(plugin, "plugin_prefs", None))
         has_changed = callable(getattr(plugin, "prefs_changed", None))
-        try:
-            with config_store.scoped(name):
-                fields = forms.render(_prefs_spec_of(plugin), plugin=name)
-        except Exception:
-            _log.debug("Panel render failed for %r", name, exc_info=True)
-            fields = []
+        fields = _build_fields(name, plugin, bool(has_prefs))
         _panels[name] = {
             "name": name,
             "has_prefs": bool(has_prefs),
@@ -145,25 +204,33 @@ def save_panel_values(
 
     Writes go through :func:`forms.apply` (existing keys are preserved),
     then the plugin's ``prefs_changed`` hook is called best-effort —
-    a failing hook is logged and never breaks the save.
+    a failing hook is logged and never breaks the save. The explanatory
+    placeholder key (see :data:`_PLACEHOLDER_KEY`) is stripped before
+    writing, so saving a spec-less panel persists nothing and wipes
+    nothing.
     """
     if not isinstance(name, str) or not name:
         return
     with _lock:
         plugin = _registry.get(name)
     try:
+        cleaned = (
+            {k: v for k, v in values.items() if k != _PLACEHOLDER_KEY}
+            if isinstance(values, dict)
+            else values
+        )
         with config_store.scoped(name):
-            forms.apply(values, plugin=name)
+            forms.apply(cleaned, plugin=name)
     except Exception:
         _log.debug("Panel save failed for %r", name, exc_info=True)
     try:
-        with config_store.scoped(name):
-            fields = forms.render(_prefs_spec_of(plugin), plugin=name)
+        has_prefs = callable(getattr(plugin, "plugin_prefs", None))
+        fields = _build_fields(name, plugin, bool(has_prefs))
         with _lock:
             if name in _panels:
                 _panels[name] = {
                     "name": name,
-                    "has_prefs": bool(callable(getattr(plugin, "plugin_prefs", None))),
+                    "has_prefs": bool(has_prefs),
                     "has_prefs_changed": bool(callable(getattr(plugin, "prefs_changed", None))),
                     "fields": fields,
                 }
