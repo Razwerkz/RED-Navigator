@@ -47,21 +47,34 @@ def import_if_empty(red_store: str, edmc_source: str) -> str:
 
     Returns ``"imported"`` on success, ``"already-present"`` when the
     red store already holds data (source is left untouched), and
-    ``"failed"`` when the source is missing/unreadable or any copy
-    step fails. The source tree is never deleted or modified.
+    ``"failed"`` when the source is missing/unreadable/empty or any
+    copy step fails. The source tree is never deleted or modified.
+
+    A failed import removes everything this call copied (and the dest
+    dir itself when this call created it) so a later retry sees an
+    empty store instead of ``"already-present"``.
     """
     dest = Path(red_store)
     if _red_store_has_data(dest):
         return "already-present"
+    # Dest is missing or an empty dir here (anything else returned
+    # above), so every copy target below is new to this call and safe
+    # to remove again on failure.
+    dest_existed = dest.exists()
+    created: list[Path] = []
     try:
         src = Path(edmc_source)
         if not src.is_dir():
             return "failed"
         if src.resolve() == dest.resolve():
             return "failed"
+        entries = sorted(src.iterdir(), key=lambda p: p.name)
+        if not entries:
+            return "failed"
         dest.mkdir(parents=True, exist_ok=True)
-        for entry in sorted(src.iterdir(), key=lambda p: p.name):
+        for entry in entries:
             target = dest / entry.name
+            created.append(target)
             if entry.is_symlink():
                 # Copy what the link points at; never recreate links
                 # that could escape the dest tree on later reads.
@@ -78,6 +91,19 @@ def import_if_empty(red_store: str, edmc_source: str) -> str:
             # Sockets, fifos, and other special files are skipped.
         config_store.set(IMPORT_SOURCE_KEY, str(src), plugin=IMPORT_PLUGIN)
     except OSError:
+        for target in created:
+            try:
+                if target.is_dir() and not target.is_symlink():
+                    shutil.rmtree(target, ignore_errors=True)
+                else:
+                    target.unlink(missing_ok=True)
+            except OSError:
+                _log.warning("Could not roll back %s", target, exc_info=True)
+        if not dest_existed:
+            try:
+                dest.rmdir()
+            except OSError:
+                pass
         _log.warning(
             "EDMC import failed (source=%s dest=%s)", edmc_source, red_store,
             exc_info=True,
