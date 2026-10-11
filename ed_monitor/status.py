@@ -197,6 +197,15 @@ def _apply_status(
     except (OSError, json.JSONDecodeError):
         return
 
+    # RED Navigator fan-out (additive): no-op unless a RED session is
+    # running; never alters status handling.
+    try:
+        from red_navigator.runtime import fanout as _red_fanout
+        if _red_fanout.is_enabled():
+            _red_fanout.dashboard_entry(data)
+    except Exception:
+        _log.debug("RED dashboard fan-out skipped", exc_info=True)
+
     flags = data.get("Flags", 0)
     if not isinstance(flags, int):
         flags = 0

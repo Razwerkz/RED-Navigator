@@ -830,6 +830,25 @@ def _follow(
                     sys_name  = state.system
                     prev_cmdr = state.commander
 
+                # RED Navigator fan-out (additive): no-op unless a RED
+                # session is running; never alters journal handling.
+                try:
+                    from red_navigator.runtime import fanout as _red_fanout
+                    if _red_fanout.is_enabled():
+                        with lock:
+                            _red_station = state.station
+                        _red_fanout.journal_entry(
+                            effective,
+                            {
+                                "cmdr": prev_cmdr,
+                                "is_beta": False,
+                                "system": sys_name,
+                                "station": _red_station,
+                            },
+                        )
+                except Exception:
+                    _log.debug("RED fan-out skipped event %r", ev_name, exc_info=True)
+
                 # Before jump: save current bodies (final state pre-jump
                 # must hit disk or we lose scans made in the previous system)
                 if ev_name in ("FSDJump", "CarrierJump"):
