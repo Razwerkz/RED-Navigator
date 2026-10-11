@@ -285,6 +285,119 @@ class SettingsScreen(Screen):
             *self._panel_rows,
         ]
 
+        # ── RED Plugins (additive; upstream rows above unchanged) ─────────────
+        # One native row per mounted RED plugin field (bool→ToggleRow,
+        # options→SelectRow, else TextRow; spec-less panels show the
+        # placeholder hint). Best-effort: never breaks upstream init.
+        self._red_rows: list = []
+        self._red_field_of: dict[int, tuple[str, str]] = {}
+        self._append_red_rows()
+
+    # ── RED Plugins helpers (additive; upstream behavior unchanged) ─────────
+
+    def _append_red_rows(self) -> None:
+        """Append one native row per RED plugin field to ``self._rows``."""
+        try:
+            from red_navigator.runtime import settings_bridge
+            sections = settings_bridge.red_sections()
+        except Exception:
+            return
+        if not sections:
+            return
+        for section in sections:
+            try:
+                if not isinstance(section, dict):
+                    continue
+                plugin = section.get("plugin", section.get("name", ""))
+                fields = section.get("fields", [])
+                if not isinstance(plugin, str) or not plugin:
+                    continue
+                if not isinstance(fields, list):
+                    continue
+                for field in fields:
+                    try:
+                        row = self._red_row_for(plugin, field)
+                        if row is None:
+                            continue
+                        self._red_rows.append(row)
+                        fkey = field.get("key", "") if isinstance(field, dict) else ""
+                        self._red_field_of[id(row)] = (plugin, fkey)
+                        self._rows.append(row)
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+
+    @staticmethod
+    def _red_row_for(plugin: str, field: dict):
+        """Map a RED field dict to a native ToggleRow/SelectRow/TextRow."""
+        if not isinstance(field, dict):
+            return None
+        key = field.get("key", "")
+        if not isinstance(key, str) or not key:
+            return None
+        label = field.get("label", key)
+        if not isinstance(label, str) or not label:
+            label = key
+        row_label = f"[{plugin}] {label}"
+        row_key = f"red:{plugin}:{key}"
+        if field.get("placeholder"):
+            hint = field.get("hint") or field.get("value") or ""
+            return TextRow(row_key, row_label, str(hint))
+        ftype = field.get("type", "text")
+        options = field.get("options", [])
+        if ftype == "bool" and not options:
+            val = field.get("value", field.get("default", False))
+            if isinstance(val, str):
+                bval = val.strip().lower() in ("1", "true", "yes", "on")
+            else:
+                bval = bool(val)
+            return ToggleRow(row_key, row_label, bval)
+        if isinstance(options, list) and len(options) > 0:
+            opts = [str(o) for o in options]
+            raw = field.get("value", field.get("default", opts[0] if opts else ""))
+            val = str(raw) if raw is not None else ""
+            if val not in opts and opts:
+                val = opts[0]
+            return SelectRow(row_key, row_label, val, opts)
+        raw = field.get("value", field.get("default", ""))
+        if raw is None:
+            raw = ""
+        return TextRow(row_key, row_label, str(raw))
+
+    def _save_red_rows(self) -> None:
+        """Persist RED plugin rows via save_red_section (per-plugin isolation).
+
+        Best-effort: one plugin's failure never blocks others and never
+        breaks the upstream save path.
+        """
+        try:
+            from red_navigator.runtime import settings_bridge
+        except Exception:
+            return
+        try:
+            values_by_plugin: dict[str, dict] = {}
+            for row in getattr(self, "_red_rows", []):
+                try:
+                    ident = self._red_field_of.get(id(row))
+                    if ident is None:
+                        continue
+                    plugin, field_key = ident
+                    if not isinstance(plugin, str) or not plugin:
+                        continue
+                    if not isinstance(field_key, str) or not field_key:
+                        continue
+                    if isinstance(row, ToggleRow):
+                        values_by_plugin.setdefault(plugin, {})[field_key] = bool(row.value)
+                    elif isinstance(row, (SelectRow, TextRow)):
+                        values_by_plugin.setdefault(plugin, {})[field_key] = row.value
+                except Exception:
+                    continue
+            if values_by_plugin:
+                settings_bridge.save_red_section(values_by_plugin)
+        except Exception:
+            pass
+
     # ── Textual lifecycle ────────────────────────────────────────────────────
 
     def on_mount(self) -> None:
@@ -563,5 +676,10 @@ class SettingsScreen(Screen):
             cfg.tts_voices[v_lang] = f"{v_lang}-{v_locale}-{v_name}"
 
         _config.save(cfg)
+        # RED Plugins save (additive; per-plugin isolation, never breaks upstream).
+        try:
+            self._save_red_rows()
+        except Exception:
+            pass
         self.post_message(SettingsScreen.Saved(cfg))
         self.app.pop_screen()
