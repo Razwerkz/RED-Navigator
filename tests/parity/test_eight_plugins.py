@@ -14,8 +14,10 @@ fixture replay only.
 
 from __future__ import annotations
 
+import copy
 import importlib.util
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -66,7 +68,8 @@ def test_fixture_replay_makes_no_live_hits(monkeypatch):
     monkeypatch.setattr(socket, "socket", _no_network)
     monkeypatch.setattr(socket, "create_connection", _no_network)
     result = parity.run(allow_live=False)
-    assert result["mode"] == "fixtures"
+    assert result["mode"] == "fixtures-smoke"
+    assert result["baseline"] == "synthetic"
     assert result["events"] > 0
     assert len(result["payloads"]) == result["events"]
     assert result["ok"] is True
@@ -127,6 +130,157 @@ def test_overlay_payload_diff_detects_mismatch():
     assert count_diffs, "payload count mismatch must produce a diff"
 
 
+class _HealthyPlugin:
+    def journal_entry(self, *args):
+        return "pong"
+
+    def journal_entry_cqc(self, *args):
+        return "pong-cqc"
+
+
+class _BrokenPlugin:
+    def journal_entry(self, *args):
+        raise RuntimeError("boom")
+
+    def journal_entry_cqc(self, *args):
+        raise RuntimeError("boom")
+
+
+class _HooklessPlugin:
+    pass
+
+
+def test_plugin_behavior_captured_in_payloads():
+    """Payloads must change when plugin behaviour changes (no false parity)."""
+    parity = _load_script("verify_parity.py")
+    entries = [{"event": "FSDJump", "StarSystem": "Sol"}]
+
+    first, _ = parity.replay_entries(entries, {"P": _HealthyPlugin()})
+    second, _ = parity.replay_entries(entries, {"P": _HealthyPlugin()})
+    assert parity.diff_payloads(first, second) == []
+    assert first[0]["plugins"]["P"]["called"] is True
+    assert first[0]["plugins"]["P"]["result"] == "pong"
+    assert first[0]["plugins"]["P"]["error"] is None
+
+    # Removing the plugin changes the payload.
+    removed, _ = parity.replay_entries(entries, {})
+    assert parity.diff_payloads(first, removed), "removed plugin must break parity"
+
+    # A hookless plugin is recorded as not called — and differs.
+    hookless, _ = parity.replay_entries(entries, {"P": _HooklessPlugin()})
+    assert hookless[0]["plugins"]["P"]["called"] is False
+    assert parity.diff_payloads(first, hookless), "hookless plugin must break parity"
+
+
+def test_broken_plugin_error_recorded_and_differs():
+    """A raising plugin records its error in the payload (never swallowed)."""
+    parity = _load_script("verify_parity.py")
+    entries = [{"event": "FSDJump", "StarSystem": "Sol"}]
+
+    healthy, _ = parity.replay_entries(entries, {"P": _HealthyPlugin()})
+    broken, summary = parity.replay_entries(entries, {"P": _BrokenPlugin()})
+    record = broken[0]["plugins"]["P"]
+    assert record["called"] is True
+    assert record["result"] is None
+    assert "RuntimeError" in str(record["error"]) and "boom" in str(record["error"])
+    assert summary["errors"] == {"P": [record["error"]]}
+    assert parity.diff_payloads(healthy, broken), "broken plugin must break parity"
+
+
+def test_load_plugin_report_records_errors_and_missing(tmp_path):
+    """Load failures surface per-plugin errors instead of silent None."""
+    parity = _load_script("verify_parity.py")
+    good = tmp_path / "EDMCModernOverlay"
+    good.mkdir()
+    (good / "load.py").write_text(
+        "def plugin_start3(plugin_dir):\n    return 'OK'\n", encoding="utf-8"
+    )
+    bad = tmp_path / "EDR"
+    bad.mkdir()
+    (bad / "load.py").write_text("raise ValueError('incompatible API')\n",
+                                 encoding="utf-8")
+
+    report = parity.load_plugin_report(str(tmp_path))
+    assert report["modules"]["EDMCModernOverlay"] is not None
+    assert report["modules"]["EDR"] is None
+    assert "EDR" in report["errors"]
+    assert "ValueError" in report["errors"]["EDR"]
+    assert "incompatible API" in report["errors"]["EDR"]
+    # One present, seven missing (six absent plus the unloadable one).
+    assert len(report["missing"]) == 7
+    assert "EDR" in report["missing"] and "HITS" in report["missing"]
+    # Back-compat wrapper keeps its mapping shape.
+    assert parity.load_plugin_modules(str(tmp_path))["EDMCModernOverlay"] is not None
+
+
+def _write_live_dirs(tmp_path):
+    plugin_dir = tmp_path / "plugins"
+    overlay = plugin_dir / "EDMCModernOverlay"
+    overlay.mkdir(parents=True)
+    (overlay / "load.py").write_text(
+        "def plugin_start3(plugin_dir):\n"
+        "    return 'LiveOverlay'\n"
+        "def journal_entry(cmdr, is_beta, system, station, entry, state):\n"
+        "    return 'live-pong'\n",
+        encoding="utf-8",
+    )
+    journal_dir = tmp_path / "journals"
+    journal_dir.mkdir()
+    (journal_dir / "Journal.260101120000.01.log").write_text(
+        json.dumps({"timestamp": "2026-01-01T12:00:00Z", "event": "FSDJump",
+                    "StarSystem": "Sol"}) + "\n",
+        encoding="utf-8",
+    )
+    return str(journal_dir), str(plugin_dir)
+
+
+def test_live_partial_plugin_set_strict_vs_allowed(tmp_path, monkeypatch):
+    """Live runs fail on a partial 8-plugin set unless --allow-partial records skips."""
+    import socket
+
+    parity = _load_script("verify_parity.py")
+    journal_dir, plugin_dir = _write_live_dirs(tmp_path)
+    monkeypatch.setattr(parity, "require_frontier_auth",
+                        lambda *, allow_live: True)
+
+    def _no_network(*args, **kwargs):
+        raise AssertionError("live replay must stay offline for fixture journals")
+
+    monkeypatch.setattr(socket, "socket", _no_network)
+    monkeypatch.setattr(socket, "create_connection", _no_network)
+
+    strict = parity.run(journal_dir=journal_dir, plugin_dir=plugin_dir,
+                        allow_live=True)
+    assert strict["mode"] == "live"
+    assert strict["ok"] is False
+    assert len(strict["missing"]) == 7
+    assert any("missing plugin: EDR" in d for d in strict["diffs"])
+
+    allowed = parity.run(journal_dir=journal_dir, plugin_dir=plugin_dir,
+                         allow_live=True, allow_partial=True)
+    assert allowed["mode"] == "live"
+    assert allowed["plugins"] == ["EDMCModernOverlay"]
+    assert len(allowed["skipped"]) == 7
+    assert all(s["reason"] for s in allowed["skipped"])
+    assert allowed["events"] == 1
+    assert allowed["payloads"][0]["plugins"]["EDMCModernOverlay"]["result"] == \
+        "live-pong"
+
+
+def test_fixture_smoke_labelled_synthetic_not_edmc_parity():
+    """Default run is smoke (synthetic); --baseline upgrades it to a parity claim."""
+    parity = _load_script("verify_parity.py")
+    smoke = parity.run()
+    assert smoke["mode"] == "fixtures-smoke"
+    assert smoke["baseline"] == "synthetic"
+    assert smoke["ok"] is True
+
+    claimed = parity.run(baseline=copy.deepcopy(smoke["payloads"]))
+    assert claimed["mode"] == "fixtures"
+    assert claimed["baseline"] == "supplied"
+    assert claimed["ok"] is True
+
+
 def test_frontier_calls_require_interactive_auth(monkeypatch):
     """Frontier auth is user-directed: never granted without live flag + yes."""
     parity = _load_script("verify_parity.py")
@@ -157,7 +311,20 @@ def test_verify_parity_fixture_mode_passes(capsys):
     parity = _load_script("verify_parity.py")
     assert parity.main([]) == 0
     out = capsys.readouterr().out
-    assert "fixtures" in out
+    assert "SMOKE OK" in out
+    assert "synthetic" in out
+
+
+def test_verify_parity_supplied_baseline_claims_parity(tmp_path, capsys):
+    """With an EDMC-captured --baseline file, a matching run prints PARITY OK."""
+    parity = _load_script("verify_parity.py")
+    smoke = parity.run()
+    baseline_file = tmp_path / "edmc_baseline.json"
+    baseline_file.write_text(json.dumps(smoke["payloads"]), encoding="utf-8")
+    assert parity.main(["--baseline", str(baseline_file)]) == 0
+    out = capsys.readouterr().out
+    assert "PARITY OK" in out
+    assert "SMOKE" not in out
 
 
 def test_resources_pass_within_baseline():
@@ -178,25 +345,69 @@ def test_resources_fail_when_red_exceeds_baseline():
     assert resources.check_against_baseline(over_ram, baseline)
 
 
-def test_verify_resources_main_modes(monkeypatch, capsys):
-    resources = _load_script("verify_resources.py")
+def _mock_measure(monkeypatch, resources, *, game_running):
     fixed_on = {"cpu_pct": 2.0, "rss_mb": 120.0, "overlay": "on",
-                "game_running": True}
+                "game_running": game_running, "pid": 1, "timestamp": 0.0}
     fixed_off = {"cpu_pct": 1.0, "rss_mb": 100.0, "overlay": "off",
-                 "game_running": True}
+                 "game_running": game_running, "pid": 1, "timestamp": 0.0}
     calls = []
 
-    def _fake_measure(*, overlay_on, journal_dirs=None):
-        calls.append(overlay_on)
+    def _fake_measure(*, overlay_on, journal_dirs=None, pid=None):
+        calls.append((overlay_on, journal_dirs, pid))
         return dict(fixed_on if overlay_on else fixed_off)
 
     monkeypatch.setattr(resources, "measure", _fake_measure)
+    return calls
+
+
+def test_verify_resources_main_modes(monkeypatch, capsys):
+    resources = _load_script("verify_resources.py")
+    calls = _mock_measure(monkeypatch, resources, game_running=True)
     assert resources.main([]) == 0
-    assert calls == [False, True]
+    assert [c[0] for c in calls] == [False, True]
     out = capsys.readouterr().out
     assert "overlay=off" in out and "overlay=on" in out
+    assert "UNCALIBRATED" in out
     # RED over baseline must fail.
     assert resources.main(["--baseline-rss-mb", "10", "--baseline-cpu", "0.5"]) == 1
+
+
+def test_placeholder_baseline_flagged_without_game(monkeypatch, capsys):
+    """Placeholder provenance is printed; no game context means INCONCLUSIVE, not PASS."""
+    resources = _load_script("verify_resources.py")
+    _mock_measure(monkeypatch, resources, game_running=False)
+    assert resources.main([]) == 0
+    out = capsys.readouterr().out
+    assert "placeholder-uncalibrated" in out
+    assert "UNCALIBRATED" in out
+    assert "INCONCLUSIVE" in out
+    assert "RESULT: PASS" not in out
+
+
+def test_require_game_fails_without_game_context(monkeypatch, capsys):
+    resources = _load_script("verify_resources.py")
+    _mock_measure(monkeypatch, resources, game_running=False)
+    assert resources.main(["--require-game"]) == 1
+    out = capsys.readouterr().out
+    assert "no game-running context" in out
+
+    _mock_measure(monkeypatch, resources, game_running=True)
+    assert resources.main(["--require-game"]) == 0
+    out = capsys.readouterr().out
+    assert "RESULT: PASS" in out
+
+
+def test_sample_pid_measures_given_process():
+    """--sample-pid plumbing reads the target PID's counters (self here)."""
+    resources = _load_script("verify_resources.py")
+    if not Path("/proc/self/status").is_file():
+        pytest.skip("no /proc — pid sampling unavailable")
+    self_pid = os.getpid()
+    assert resources.read_pid_rss_mb(self_pid) > 0.0
+    assert resources.read_pid_cpu_pct(self_pid, interval=0.01) >= 0.0
+    sample = resources.measure(overlay_on=True, pid=self_pid)
+    assert sample["pid"] == self_pid
+    assert sample["rss_mb"] > 0.0
 
 
 def test_scripts_never_touch_ed_monitor():

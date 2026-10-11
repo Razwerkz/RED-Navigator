@@ -6,6 +6,11 @@ for all 8 Proton-baseline plugins, captures the overlay payloads the
 game-window broadcaster would receive, and diffs them against
 EDMC-captured baselines.
 
+Each captured payload embeds per-plugin observable output (which hook
+ran, its return value, any error), so a changed, removed, or broken
+plugin always changes the payload and breaks parity — the rig cannot
+report false parity when plugins diverge.
+
 Safety contract (never violated):
 
 * Journals and real plugin directories are reference-only: they are
@@ -17,6 +22,12 @@ Safety contract (never violated):
   prompt (see :func:`require_frontier_auth`). There is no autonomous
   auth path, and non-interactive stdin never authenticates.
 * This script never imports ``ed_monitor`` and changes no NOVA behavior.
+
+Baseline honesty: the default offline run diffs against a synthetic
+baseline regenerated from the same fixtures (``mode=fixtures-smoke``,
+``baseline=synthetic``) — it proves the replay path works but claims
+nothing about EDMC. A real parity claim (``PARITY OK``) requires an
+EDMC-captured baseline via ``--baseline``.
 
 Exit codes: 0 = parity holds (no diffs), 1 = diffs found or live run
 refused/failed safely, 2 = usage error.
@@ -117,9 +128,11 @@ class _RecordingPlugin:
 
     def journal_entry(self, cmdr, is_beta, system, station, entry, state):
         self._log.append((self._name, dict(entry)))
+        return f"{self._name}:saw:{entry.get('event', '?')}"
 
     def journal_entry_cqc(self, cmdr, is_beta, system, station, entry, state):
         self._log.append((self._name, dict(entry)))
+        return f"{self._name}:saw-cqc:{entry.get('event', '?')}"
 
 
 def fixture_plugins() -> dict[str, _RecordingPlugin]:
@@ -128,39 +141,107 @@ def fixture_plugins() -> dict[str, _RecordingPlugin]:
     return {name: _RecordingPlugin(name, log) for name in EIGHT_PLUGINS}
 
 
-def load_plugin_modules(
+def load_plugin_report(
     plugin_dir: str, wanted: tuple[str, ...] = EIGHT_PLUGINS
-) -> dict[str, Any | None]:
+) -> dict[str, Any]:
     """Load real plugins from ``plugin_dir`` (read-only; never writes).
 
-    Returns ``{name: module}`` for each of the 8 baseline names; names
-    not present under ``plugin_dir`` map to ``None`` (recorded as
-    skipped, never an error). Loading only executes each plugin's
-    ``load.py`` in the Task 2 sandbox; nothing is written back.
+    Returns ``{"modules": {name: module | None}, "errors": {name: str},
+    "missing": [names]}`` for the wanted baseline names. A name is
+    missing when its folder is absent *or* its ``load.py`` raised during
+    import — the error text is recorded, never swallowed, so the exact
+    V1 incompatibility surfaces in the result. Loading only executes
+    each plugin's ``load.py`` in the Task 2 sandbox; nothing is written
+    back.
     """
     found = loader.discover_plugins(plugin_dir)
     by_name = {Path(p).name: p for p in found}
     modules: dict[str, Any | None] = {}
+    errors: dict[str, str] = {}
+    missing: list[str] = []
     for name in wanted:
         path = by_name.get(name)
         if path is None:
             modules[name] = None
+            missing.append(name)
             continue
         try:
             modules[name] = loader.load_plugin(path)
-        except Exception:
+        except Exception as exc:
             modules[name] = None
-    return modules
+            errors[name] = f"{type(exc).__name__}: {exc}"
+            missing.append(name)
+    return {"modules": modules, "errors": errors, "missing": missing}
+
+
+def load_plugin_modules(
+    plugin_dir: str, wanted: tuple[str, ...] = EIGHT_PLUGINS
+) -> dict[str, Any | None]:
+    """Back-compat wrapper returning only the modules mapping.
+
+    Prefer :func:`load_plugin_report`, which also records per-plugin
+    load errors instead of silently mapping failures to ``None``.
+    """
+    return load_plugin_report(plugin_dir, wanted)["modules"]  # type: ignore[return-value]
+
+
+def _json_safe(value: Any) -> Any:
+    """Return ``value`` if JSON-round-trippable, else its ``repr``."""
+    try:
+        json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        return repr(value)
+    if isinstance(value, (dict, list, str, int, float, bool)) or value is None:
+        return value
+    return repr(value)
+
+
+def _invoke_hook(
+    plugin: Any,
+    *,
+    in_cqc: bool,
+    cmdr: str,
+    is_beta: bool,
+    system: str,
+    station: str,
+    entry: dict[str, Any],
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    """Invoke one plugin hook and capture its observable output.
+
+    Routing mirrors :func:`loader.dispatch_entry` exactly (``in_cqc``
+    entries go to ``journal_entry_cqc`` and never to ``journal_entry``;
+    all others go to ``journal_entry``), but unlike the loader — which
+    discards hook returns and logs away exceptions — the record
+    ``{"hook", "called", "result", "error"}`` is returned so plugin
+    behaviour participates in the parity diff.
+    """
+    hook = "journal_entry_cqc" if in_cqc else "journal_entry"
+    fn = getattr(plugin, hook, None)
+    if not callable(fn):
+        return {"hook": hook, "called": False, "result": None, "error": None}
+    try:
+        result = fn(cmdr, is_beta, system, station, entry, state)
+    except Exception as exc:
+        return {
+            "hook": hook,
+            "called": True,
+            "result": None,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    return {"hook": hook, "called": True, "result": _json_safe(result),
+            "error": None}
 
 
 def _overlay_payload(
     entry: dict[str, Any], state: dict[str, Any], cmdr: str
 ) -> dict[str, Any]:
-    """Build the overlay payload for one journal event.
+    """Build the overlay payload base for one journal event.
 
     This is the identical dict shape the game-window broadcaster
     receives (see ``overlay_host.host.publish``); ``mirror`` renders the
     same dict for the terminal pane, so capturing it here covers both.
+    Per-plugin records are attached by :func:`replay_entries`.
     """
     payload = {
         "event": str(entry.get("event", "")),
@@ -182,13 +263,16 @@ def replay_entries(
     """Replay ``entries`` through ``plugins`` via the Task 2 shim.
 
     Entries are folded into an EDMC-style state dict (Task 2
-    ``state_builder``), routed to ``journal_entry`` or
-    ``journal_entry_cqc`` by the live CQC flag (Task 2 ``dispatch_entry``),
-    and captured as overlay payloads. Returns ``(payloads, summary)``.
+    ``state_builder``), routed per entry by the live CQC flag with the
+    same rule as Task 2 ``dispatch_entry``, and captured as overlay
+    payloads. Every payload embeds each plugin's observable output, so
+    changing, removing, or breaking any plugin changes the payloads.
+    Returns ``(payloads, summary)``.
     """
     state = state_builder.build_state()
     payloads: list[dict[str, Any]] = []
-    delivered = 0
+    delivered_total = 0
+    hook_errors: dict[str, list[str]] = {}
     for entry in entries:
         if not isinstance(entry, dict):
             continue
@@ -196,19 +280,38 @@ def replay_entries(
         system = str(state.get("SystemName", "") or "")
         station = str(state.get("StationName", "") or "")
         in_cqc = bool(state.get("InCQC", False))
-        for plugin in plugins.values():
+        per_plugin: dict[str, Any] = {}
+        delivered = 0
+        for name, plugin in plugins.items():
+            key = str(name)
             if plugin is None:
+                per_plugin[key] = {
+                    "hook": "journal_entry_cqc" if in_cqc else "journal_entry",
+                    "called": False,
+                    "result": None,
+                    "error": "plugin not loaded",
+                }
+                hook_errors.setdefault(key, []).append("plugin not loaded")
                 continue
-            loader.dispatch_entry(
-                plugin, dict(entry), in_cqc=in_cqc, cmdr=cmdr,
-                is_beta=is_beta, system=system, station=station, state=state,
+            record = _invoke_hook(
+                plugin, in_cqc=in_cqc, cmdr=cmdr, is_beta=is_beta,
+                system=system, station=station, entry=entry, state=state,
             )
-            delivered += 1
-        payloads.append(_overlay_payload(entry, state, cmdr))
+            per_plugin[key] = record
+            if record["called"]:
+                delivered += 1
+                delivered_total += 1
+            if record["error"] is not None:
+                hook_errors.setdefault(key, []).append(str(record["error"]))
+        payload = _overlay_payload(entry, state, cmdr)
+        payload["deliveries"] = delivered
+        payload["plugins"] = per_plugin
+        payloads.append(payload)
     summary = {
         "events": len(payloads),
-        "plugins": sorted(plugins),
-        "deliveries": delivered,
+        "plugins": sorted(str(n) for n in plugins),
+        "deliveries": delivered_total,
+        "errors": hook_errors,
     }
     return payloads, summary
 
@@ -240,7 +343,9 @@ def diff_payloads(
 ) -> list[str]:
     """Diff RED-captured payloads against EDMC-captured baselines.
 
-    Returns human-readable diff lines; empty means 1:1 parity.
+    Comparison covers the full canonical payload including per-plugin
+    hook records. Returns human-readable diff lines; empty means 1:1
+    parity.
     """
     diffs: list[str] = []
     if len(red) != len(baseline):
@@ -270,6 +375,12 @@ def load_baseline(path: str) -> list[dict[str, Any]]:
     return [entry for entry in data if isinstance(entry, dict)]
 
 
+def _synthetic_baseline() -> list[dict[str, Any]]:
+    """Regenerate the fixture expectation (labels the run as smoke, not parity)."""
+    expected, _ = replay_entries(fixture_events(), fixture_plugins())
+    return expected
+
+
 def run(
     *,
     journal_dir: str | None = None,
@@ -277,20 +388,27 @@ def run(
     baseline: list[dict[str, Any]] | None = None,
     baseline_path: str | None = None,
     allow_live: bool = False,
+    allow_partial: bool = False,
     fixtures: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Run one verification pass; never raises for missing live inputs.
 
-    Fixture mode (default): replay embedded fixtures through per-plugin
-    recording stand-ins and diff against ``baseline`` (or the
-    regenerated fixture expectation when none is supplied, so the
-    default smoke run exercises the full path with zero diffs).
+    Fixture smoke (default): replay embedded fixtures through per-plugin
+    recording stand-ins and diff against a synthetic baseline
+    (``mode=fixtures-smoke``, ``baseline=synthetic``). This exercises the
+    full replay path but claims nothing about EDMC.
+
+    Fixture comparison: same replay with an EDMC-captured ``baseline``
+    (``mode=fixtures``, ``baseline=supplied``).
 
     Live mode: only when ``allow_live`` *and* interactive auth succeeds
     *and* both real paths exist; replays the real journal dir through
-    the real 8 plugins (read-only). Otherwise falls back to fixtures and
-    records the refusal in the result.
+    the real 8 plugins (read-only). A live run fails unless all 8
+    plugins load, or ``allow_partial`` records the skip reason per
+    missing plugin. Otherwise falls back to fixtures-smoke and records
+    the refusal in the result.
     """
+    baseline_kind = "supplied" if (baseline is not None or baseline_path) else None
     if baseline_path is not None:
         baseline = load_baseline(baseline_path)
 
@@ -304,49 +422,85 @@ def run(
     )
     if live_ok:
         assert journal_dir is not None and plugin_dir is not None
-        modules = load_plugin_modules(plugin_dir)
+        report = load_plugin_report(plugin_dir)
+        modules = report["modules"]
         present = {k: v for k, v in modules.items() if v is not None}
-        if not present:
+        missing: list[str] = report["missing"]
+        load_errors: dict[str, str] = report["errors"]
+        if missing and not allow_partial:
+            diffs = [f"missing plugin: {name}" for name in missing]
+            diffs += [f"load error {name}: {err}"
+                      for name, err in load_errors.items()]
             return {
-                "mode": "fixtures-fallback",
-                "reason": "no baseline plugins found; refusing empty live run",
-                "events": 0, "plugins": [], "payloads": [], "diffs": [],
+                "mode": "live",
+                "baseline": baseline_kind or "none",
+                "events": 0,
+                "plugins": sorted(present),
+                "missing": missing,
+                "load_errors": load_errors,
+                "skipped": [],
+                "payloads": [],
+                "diffs": diffs,
                 "ok": False,
             }
+        skipped = (
+            [{"plugin": name,
+              "reason": ("not present under plugin dir; recorded skip via "
+                         "--allow-partial" if name not in load_errors
+                         else f"load failed ({load_errors[name]}); recorded "
+                              "skip via --allow-partial")}
+             for name in missing]
+            if allow_partial else []
+        )
         payloads = replay_journal_dir(journal_dir, present)
         mode = "live"
         names = sorted(present)
+        extra: dict[str, Any] = {
+            "missing": missing, "load_errors": load_errors, "skipped": skipped,
+        }
     else:
         events = copy.deepcopy(fixtures) if fixtures is not None else fixture_events()
         plugins = fixture_plugins()
         payloads, summary = replay_entries(events, plugins)
-        mode = "fixtures"
         names = summary["plugins"]
+        extra = {"hook_errors": summary["errors"]}
         if not allow_live:
             reason = "fixture mode (no --allow-live: no live hits)"
         elif journal_dir is None or plugin_dir is None:
             reason = "fixture mode (live paths not supplied)"
         else:
             reason = "fixture mode (live not authorised or paths missing)"
+        extra["reason"] = reason
+        if baseline is None:
+            mode = "fixtures-smoke"
+            baseline_kind = "synthetic"
+        else:
+            mode = "fixtures"
 
     if baseline is None:
-        # Default smoke expectation: regenerate from the same fixtures so
-        # the offline run is self-consistent (real EDMC-captured
-        # baselines are supplied via --baseline in true parity runs).
-        expected, _ = replay_entries(fixture_events(), fixture_plugins())
-        baseline = expected if mode == "fixtures" else []
+        if mode == "live":
+            baseline = []
+            baseline_kind = "none"
+        else:
+            # Synthetic default: proves the path works; NOT an EDMC claim.
+            baseline = _synthetic_baseline()
+            baseline_kind = "synthetic"
 
     diffs = diff_payloads(payloads, baseline)
+    if baseline_kind == "none":
+        diffs.insert(
+            0, "no EDMC baseline supplied (--baseline is required for a parity claim)"
+        )
     result: dict[str, Any] = {
         "mode": mode,
+        "baseline": baseline_kind,
         "events": len(payloads),
         "plugins": names,
         "payloads": payloads,
         "diffs": diffs,
         "ok": not diffs,
     }
-    if mode == "fixtures":
-        result["reason"] = reason
+    result.update(extra)
     return result
 
 
@@ -364,6 +518,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-live", action="store_true",
                         help="Permit a live (read-only) replay; still requires "
                              "interactive 'yes' auth at the prompt.")
+    parser.add_argument("--allow-partial", action="store_true",
+                        help="Live mode: proceed when some of the 8 plugins are "
+                             "missing/unloadable, recording a skip reason per "
+                             "plugin. Without it the run fails.")
     parser.add_argument("--json-out", default=None,
                         help="Write the full result JSON to this path "
                              "(never inside a journal/plugin dir).")
@@ -381,15 +539,22 @@ def main(argv: list[str] | None = None) -> int:
             plugin_dir=args.plugin_dir,
             baseline_path=args.baseline,
             allow_live=args.allow_live,
+            allow_partial=args.allow_partial,
         )
     except (OSError, ValueError) as exc:
         print(f"parity run failed safely: {exc}", flush=True)
         return 1
     summary = (
-        f"mode={result['mode']} events={result['events']} "
-        f"plugins={len(result['plugins'])} diffs={len(result['diffs'])}"
+        f"mode={result['mode']} baseline={result.get('baseline', '?')} "
+        f"events={result['events']} plugins={len(result['plugins'])} "
+        f"diffs={len(result['diffs'])}"
     )
-    if result["ok"]:
+    if result["ok"] and result.get("baseline") == "synthetic":
+        print(f"SMOKE OK ({summary})", flush=True)
+        print("WARNING: synthetic baseline — replay path works, but this "
+              "claims nothing about EDMC parity. Supply --baseline with an "
+              "EDMC-captured payload file for a real parity claim.", flush=True)
+    elif result["ok"]:
         print(f"PARITY OK ({summary})", flush=True)
     else:
         print(f"PARITY MISMATCH ({summary})", flush=True)
