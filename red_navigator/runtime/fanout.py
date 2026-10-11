@@ -236,6 +236,8 @@ def dashboard_entry(data: dict) -> None:
         # Log with full JSON dumps (mirror.to_textual falls through to
         # json.dumps for dicts without event keys). Only mirror
         # overlay-shaped payloads; host.publish above is unchanged.
+        if data.get("event") == "Status":
+            return
         if any(k in data for k in ("event", "type", "text", "message")):
             _emit_mirror(dict(data))
     except Exception:
