@@ -142,3 +142,30 @@ def test_plugin_without_prefs_and_without_spec_has_no_fields():
     panel = host_panel.get_panel("Bare")
     assert panel["has_prefs"] is False
     assert panel["fields"] == []
+
+
+def test_list_registered_includes_unmounted():
+    from red_navigator.settings_ui import host_panel
+    host_panel.register_plugin("Unmounted", None)
+    assert "Unmounted" in host_panel.list_registered()
+    assert host_panel.get_panel("Unmounted") is None
+
+
+def test_ensure_mounted_mounts_registered_plugin():
+    from red_navigator.settings_ui import host_panel
+    host_panel.register_plugin("Lazy", None)
+    assert host_panel.get_panel("Lazy") is None
+    assert host_panel.ensure_mounted("Lazy") is True
+    assert host_panel.get_panel("Lazy") is not None
+
+
+def test_ensure_mounted_unknown_name_returns_false_without_mounting():
+    from red_navigator.settings_ui import host_panel
+    assert host_panel.ensure_mounted("Nope") is False
+    assert host_panel.get_panel("Nope") is None
+
+
+def test_ensure_mounted_invalid_names_return_false():
+    from red_navigator.settings_ui import host_panel
+    assert host_panel.ensure_mounted("") is False
+    assert host_panel.ensure_mounted(None) is False

@@ -291,6 +291,7 @@ class SettingsScreen(Screen):
         # placeholder hint). Best-effort: never breaks upstream init.
         self._red_rows: list = []
         self._red_field_of: dict[int, tuple[str, str]] = {}
+        self._red_placeholder_ids: set[int] = set()
         self._append_red_rows()
 
     # ── RED Plugins helpers (additive; upstream behavior unchanged) ─────────
@@ -322,6 +323,8 @@ class SettingsScreen(Screen):
                         self._red_rows.append(row)
                         fkey = field.get("key", "") if isinstance(field, dict) else ""
                         self._red_field_of[id(row)] = (plugin, fkey)
+                        if isinstance(field, dict) and field.get("placeholder"):
+                            self._red_placeholder_ids.add(id(row))
                         self._rows.append(row)
                     except Exception:
                         continue
@@ -377,8 +380,11 @@ class SettingsScreen(Screen):
             return
         try:
             values_by_plugin: dict[str, dict] = {}
+            placeholder_ids = getattr(self, "_red_placeholder_ids", set())
             for row in getattr(self, "_red_rows", []):
                 try:
+                    if id(row) in placeholder_ids:
+                        continue
                     ident = self._red_field_of.get(id(row))
                     if ident is None:
                         continue
@@ -457,6 +463,10 @@ class SettingsScreen(Screen):
         elif self._cursor < n_rows:
             row = self._rows[self._cursor]
             if isinstance(row, TextRow):
+                # RED spec-less placeholder rows are informational only —
+                # never open an editor for them (their hint is discarded on save).
+                if id(row) in getattr(self, "_red_placeholder_ids", set()):
+                    return
                 self._open_editor(row)
 
     def _cycle(self, direction: int) -> None:

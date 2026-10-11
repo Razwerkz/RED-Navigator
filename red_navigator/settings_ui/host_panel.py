@@ -147,6 +147,38 @@ def mount_for_plugin(name: str) -> None:
         }
 
 
+def list_registered() -> list[str]:
+    """Return sorted display names of all registered plugins.
+
+    Includes names registered via :func:`register_plugin` whose panels
+    have not been mounted yet (contrast :func:`list_panels`).
+    """
+    with _lock:
+        return sorted(_registry)
+
+
+def ensure_mounted(name: str) -> bool:
+    """Mount the panel for registered ``name`` when missing.
+
+    Calls :func:`mount_for_plugin` when ``name`` is registered but has
+    no panel yet. Returns whether a panel exists for ``name``
+    afterwards. Never raises (returns ``False`` on error or for
+    invalid/unknown names).
+    """
+    if not isinstance(name, str) or not name:
+        return False
+    try:
+        with _lock:
+            if name in _panels or name not in _registry:
+                return name in _panels
+        mount_for_plugin(name)
+        with _lock:
+            return name in _panels
+    except Exception:
+        _log.debug("ensure_mounted failed for %r", name, exc_info=True)
+        return False
+
+
 def mount_loaded(plugin: Any, plugin_dir: str) -> str:
     """Register ``plugin`` under its ``plugin_start3`` name and mount it.
 

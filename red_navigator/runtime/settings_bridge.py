@@ -19,20 +19,22 @@ def _ensure_mounted(names: list[str] | None = None) -> None:
     """Mount registered-but-unmounted plugins so panels exist.
 
     Best-effort; never raises. When ``names`` is given only those names
-    are ensured, otherwise every registered name is ensured.
+    are ensured, otherwise every registered name is ensured. Uses the
+    public :func:`host_panel.list_registered` /
+    :func:`host_panel.ensure_mounted` helpers.
     """
     try:
         if names is None:
-            registry = getattr(host_panel, "_registry", None)
-            if not isinstance(registry, dict):
+            try:
+                names = host_panel.list_registered()
+            except Exception:
+                _log.debug("list_registered failed", exc_info=True)
                 return
-            names = list(registry.keys())
         for name in names:
             try:
                 if not isinstance(name, str) or not name:
                     continue
-                if host_panel.get_panel(name) is None:
-                    host_panel.mount_for_plugin(name)
+                host_panel.ensure_mounted(name)
             except Exception:
                 _log.debug("Panel mount failed for %r", name, exc_info=True)
                 continue
@@ -116,7 +118,7 @@ def save_red_section(values_by_plugin: dict) -> dict[str, dict[str, Any]]:
                 continue
             try:
                 if host_panel.get_panel(name) is None:
-                    host_panel.mount_for_plugin(name)
+                    host_panel.ensure_mounted(name)
             except Exception:
                 _log.debug(
                     "Panel ensure-mount failed for %r", name, exc_info=True
