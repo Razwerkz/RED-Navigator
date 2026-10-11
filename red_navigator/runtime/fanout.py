@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from collections.abc import Callable
 from typing import Any
 
 _log = logging.getLogger("red_navigator.runtime.fanout")
@@ -41,6 +42,42 @@ _test_plugins: list[Any] = []
 #: Last commander seen via journal ctx (dashboard_entry has no ctx arg).
 _last_cmdr: str = ""
 _last_is_beta: bool = False
+
+#: Mirror-line sink receiving ``mirror.to_textual(payload)`` output
+#: (wired to AppState.push_event by the launcher; None detaches).
+_event_sink: Callable[[str], None] | None = None
+
+
+def set_event_sink(push: Callable[[str], None] | None) -> None:
+    """Attach (or detach with ``None``) the mirror-line event sink.
+
+    The sink receives ``mirror.to_textual(payload)`` for every payload
+    fanned out via :func:`journal_entry` / :func:`dashboard_entry`.
+    Delivery is exception-contained, so a throwing sink never
+    propagates to the monitor-thread caller.
+    """
+    global _event_sink
+    with _lock:
+        _event_sink = push if (push is None or callable(push)) else None
+
+
+def _emit_mirror(payload: dict) -> None:
+    """Render ``payload`` and deliver it to the event sink. Never raises."""
+    with _lock:
+        sink = _event_sink
+    if sink is None:
+        return
+    try:
+        from red_navigator.overlay_host import mirror
+
+        line = mirror.to_textual(payload)
+    except Exception:
+        _log.debug("mirror render failed", exc_info=True)
+        return
+    try:
+        sink(line)
+    except Exception:
+        _log.debug("event sink failed", exc_info=True)
 
 
 def is_enabled() -> bool:
@@ -160,6 +197,7 @@ def journal_entry(entry: dict, ctx: dict) -> None:
             host.publish(dict(entry))
         except Exception:
             _log.debug("journal_entry overlay publish failed", exc_info=True)
+        _emit_mirror(dict(entry))
     except Exception:
         _log.exception("fanout.journal_entry failed")
 
@@ -193,5 +231,6 @@ def dashboard_entry(data: dict) -> None:
             host.publish(dict(data))
         except Exception:
             _log.debug("dashboard_entry overlay publish failed", exc_info=True)
+        _emit_mirror(dict(data))
     except Exception:
         _log.exception("fanout.dashboard_entry failed")
