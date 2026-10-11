@@ -231,6 +231,12 @@ def dashboard_entry(data: dict) -> None:
             host.publish(dict(data))
         except Exception:
             _log.debug("dashboard_entry overlay publish failed", exc_info=True)
-        _emit_mirror(dict(data))
+        # Status.json polls (~1 Hz) are raw dashboard state (Flags/Pips/...)
+        # with no overlay-shaped keys; mirroring them would flood the Event
+        # Log with full JSON dumps (mirror.to_textual falls through to
+        # json.dumps for dicts without event keys). Only mirror
+        # overlay-shaped payloads; host.publish above is unchanged.
+        if any(k in data for k in ("event", "type", "text", "message")):
+            _emit_mirror(dict(data))
     except Exception:
         _log.exception("fanout.dashboard_entry failed")

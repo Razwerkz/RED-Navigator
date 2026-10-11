@@ -20,3 +20,14 @@ def test_sink_never_raises_to_monitor_thread():
         fanout.journal_entry({"event": "Docked"}, {})
     finally:
         fanout.set_event_sink(None)
+
+
+def test_dashboard_status_poll_delivers_nothing_to_sink():
+    from red_navigator.runtime import fanout
+    seen = []
+    fanout.set_event_sink(seen.append)
+    try:
+        fanout.dashboard_entry({"Flags": 0, "Pips": [4, 4, 4]})
+    finally:
+        fanout.set_event_sink(None)
+    assert seen == []

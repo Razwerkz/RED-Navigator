@@ -92,12 +92,15 @@ def red_sections() -> list[dict[str, Any]]:
 def save_red_section(values_by_plugin: dict) -> dict[str, dict[str, Any]]:
     """Persist per-plugin values with per-plugin isolation.
 
-    Each plugin's values go through :func:`host_panel.save_panel_values`
-    so a failing ``prefs_changed`` hook never breaks the save; a raised
+    Each plugin's values go through :func:`host_panel.save_panel_values`,
+    which contains failures internally (it logs and swallows them), so a
+    failing ``prefs_changed`` hook never breaks the save; a raised
     exception for one plugin is recorded and the rest still save.
 
-    Returns ``{plugin_name: {"ok": bool, "error": str | None}}``. Never
-    raises; returns ``{}`` for non-dict input.
+    Returns ``{plugin_name: {"ok": bool, "error": str | None}}``. ``ok``
+    reflects successful dispatch to ``save_panel_values``, not verified
+    persistence, since that helper never raises on per-plugin failures.
+    Never raises; returns ``{}`` for non-dict input.
     """
     if not isinstance(values_by_plugin, dict):
         return {}

@@ -86,6 +86,7 @@ class TextRow:
 # ── Screen ────────────────────────────────────────────────────────────────────
 
 import asyncio
+import logging
 import threading
 
 from textual.app import ComposeResult
@@ -99,6 +100,8 @@ from .. import config as _config
 from ..config import Config
 from . import palette as P
 from ..ui.palette import _theme_dir
+
+_log = logging.getLogger("ed_monitor.ui.settings_screen")
 
 _SUPPORTED_LANGS = ["en", "de", "fr", "it", "es", "pt", "ru"]
 # "auto" = empty string in config (language auto-detected from message content)
@@ -400,7 +403,16 @@ class SettingsScreen(Screen):
                 except Exception:
                     continue
             if values_by_plugin:
-                settings_bridge.save_red_section(values_by_plugin)
+                results = settings_bridge.save_red_section(values_by_plugin)
+                try:
+                    for plugin, res in results.items():
+                        if isinstance(res, dict) and not res.get("ok", False):
+                            _log.warning(
+                                "RED plugin save failed for %r: %s",
+                                plugin, res.get("error"),
+                            )
+                except Exception:
+                    pass
         except Exception:
             pass
 
