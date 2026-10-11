@@ -1,5 +1,20 @@
 # Changelog
 
+## RED Navigator — 2026-10-11
+
+### Changes
+
+- **Rebrand to RED Navigator** — README rewritten for the RED identity
+  (terminal-first companion consolidating EDMC plugins + overlay),
+  with fork attribution to NOVA (Nicolas Kerscher, MIT, upstream
+  commit `8917390f…0005`), RED quick start
+  (`python -m red_navigator.app`), v1 feature set, and the EDNA /
+  Discord-presence roadmap. LICENSE keeps the original NOVA copyright
+  line intact and adds the RED Navigator copyright (Razwerkz, 2026).
+  No code changes.
+
+---
+
 ## v2.20.5 — 2026-07-31
 
 ### Bug Fixes

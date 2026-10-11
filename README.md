@@ -1,146 +1,143 @@
-# NOVA — Navigation, Operations, and Vessel Assistance
+# RED Navigator
 
-> [!NOTE]
-> This project is 100 % vibe-coded with LLM AI (Claude by Anthropic, Kimi by Moonshot AI). Every line of code, every feature, and every bug fix was written through AI-assisted development.
+A terminal-first companion for **Elite Dangerous** on PC. RED Navigator
+consolidates a resource-heavy companion stack — standalone EDMC plus its
+plugins plus the in-game overlay — into one light process, so you can
+close most of the other windows while you fly.
 
-A real-time TUI companion for **Elite Dangerous**. Tails the journal, speaks events via TTS, and renders a cockpit-style dashboard in your terminal.
+It does this by hosting your existing EDMC plugins and the Modern
+Overlay inside a live terminal dashboard, with the same plugin behaviour
+and the same game-window overlay you had under EDMC.
+
+> **Fork attribution:** RED Navigator is a fork of
+> **NOVA** (Navigation, Operations, and Vessel Assistance) by
+> **Nicolas Kerscher**, MIT-licensed —
+> https://github.com/KernicDE/nova-ed-monitor —
+> pinned at upstream commit
+> `8917390f55552b11e24a71fd9cea440136ff0005`
+> (v2.20.5). The NOVA base (live journal tail, Status.json dashboard,
+> Textual TUI, TTS, routing) is preserved underneath; the RED layer on
+> top is described below. See `LICENSE` and
+> `docs/superpowers/plans/NOVA_FORK_INVENTORY.md`.
 
 ---
 
 ## Quick Start
 
-### Linux
+Requirements: **Python 3.11+**, Linux (v1 is Linux-only; the game is
+expected via Proton/Steam).
 
 ```bash
-curl -O https://raw.githubusercontent.com/KernicDE/nova-ed-monitor/main/nova.sh
-chmod +x nova.sh
-./nova.sh
+# from the repo root
+.venv/bin/python -m red_navigator.app
 ```
 
-### Windows
+Useful flags:
 
-1. Download [`nova.ps1`](https://raw.githubusercontent.com/KernicDE/nova-ed-monitor/main/nova.ps1) — right-click → **Save As** into a folder of your choice (e.g. `C:\Nova\`).
-2. Right-click **`nova.ps1`** → **Run with PowerShell**.
+```bash
+.venv/bin/python -m red_navigator.app --no-overlay   # terminal-only, no game-window overlay
+.venv/bin/python -m red_navigator.app --plugin-dir <path>  # override EDMC plugin dir
+.venv/bin/python -m red_navigator.app --store-dir <path>   # override RED data dir
+```
 
-> If PowerShell blocks the script, run once: `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`.
+What happens on launch:
 
-Both launchers install Python (if missing), create a `venv` next to the script, install NOVA, and auto-update on every subsequent launch. **All data lives in the same folder as the launcher** — config, database, logs, venv. Nothing is installed system-wide.
+1. The plugin dir defaults to the Proton EDMC install
+   (`compatdata/359320/.../AppData/Local/EDMarketConnector/plugins/`,
+   probed across Steam library roots, with the native
+   `~/.config/EDMarketConnector` as fallback).
+2. On first run with no RED data present, settings are imported from
+   your EDMC data dir. If the import fails you are asked whether to
+   retry or start fresh — it never proceeds silently.
+3. The session loads each plugin's `load.py` unchanged, starts the
+   overlay host (unless `--no-overlay`), and drops you into the NOVA
+   terminal UI with the RED feeds fanning journal/Status events into
+   the plugins.
 
-Full installation options (pip, wheel, standalone Linux binary, clone) are in **[docs/Installation.md](docs/Installation.md)**.
+Journal files are **read-only, never altered**. The journal search
+covers Proton compatdata locations plus native fallbacks, overridable
+via `RED_NAVIGATOR_JOURNAL_DIR`.
 
 ---
 
-## Documentation
+## What RED Navigator adds (v1)
+
+- **EDMC plugin shim** (`red_navigator/edmc_compat/`): clean-room
+  implementation of the documented plugin contract — `plugin_start3`,
+  `plugin_stop`, `journal_entry`, `journal_entry_cqc`,
+  `dashboard_entry`, the `cmdr_data` family, per-plugin namespaced
+  `config` persistence, `monitor.game_running()` /
+  `monitor.is_live_galaxy()`, and EDMC-style logging bridging. Each
+  plugin's `load.py` loads unchanged in a per-plugin sandbox so
+  same-named sibling modules never collide. Target set: the 8
+  currently installed plugins (ArtemisScannerTracker-0.3.4b,
+  cargo-manifest, docking_denied_reason, EDMC-Canonn-7.8.0,
+  EDMCModernOverlay, EDR, EDSM-RSE, HITS).
+- **1:1 Modern Overlay host** (`red_navigator/overlay_host/`): runs
+  the unmodified Modern Overlay plugin code — same WebSocket
+  broadcaster, `port.json` handshake, legacy TCP path, grouping and
+  profile stores reused in place. `port.json` uses single-owner
+  semantics with stale-file cleanup, so a live EDMC owner is shared,
+  never clobbered.
+- **Terminal mirror**: every payload sent to the game-window overlay
+  is also rendered as text into the terminal event log, so the
+  terminal is useful on its own and the external overlay can be
+  toggled off for lighter nights.
+- **Per-plugin settings UI** (`red_navigator/settings_ui/`): each
+  loaded plugin exposing `plugin_prefs` / `prefs_changed` gets a
+  settings panel rendered from a generic form layer, hosted in NOVA's
+  `s`-key settings overlay. Values persist across restarts and survive
+  plugin updates that add new keys.
+- **Runtime bridge** (`red_navigator/runtime/` + `feeds/`): journal and
+  Status.json feeds are fanned out to all loaded plugins with
+  copy-on-dispatch (a misbehaving plugin can never corrupt the live
+  event or stall the monitor threads). Broken plugins are skipped with
+  a log; overlay failure degrades to terminal-only, never a crash.
+
+## NOVA base (unchanged)
+
+The underlying dashboard is still NOVA: live journal tail with TTS
+voicelines, cockpit-style Textual panels (situational, route,
+exploration, bio/neutron), config hot-reload, and Proton journal
+auto-detection. NOVA-specific guides live in `docs/`:
 
 | Guide | Contents |
 |-------|----------|
-| **[Installation & Update](docs/Installation.md)** | Launcher scripts, pip install, data paths, uninstall, troubleshooting. |
-| **[Settings](docs/Settings.md)** | Every `config.toml` key, voiceline customisation, template engine, stream overlay. |
-| **[Usage Guide](docs/Usage.md)** | Keyboard shortcuts, every panel explained, bio/neutron/high-G workflows, stats. |
+| [Installation & Update](docs/Installation.md) | NOVA launcher scripts, pip install, data paths, troubleshooting. |
+| [Settings](docs/Settings.md) | NOVA `config.toml` keys, voicelines, themes. |
+| [Usage Guide](docs/Usage.md) | NOVA keyboard shortcuts and panels. |
+
+Note: those docs describe the NOVA base (including its own
+`nova.sh`/`nova.ps1` launchers and Windows/macOS paths). The RED
+layer itself is v1 Linux-only and launched via
+`python -m red_navigator.app` as above.
 
 ---
 
-## Features at a glance
+## Status
 
-### Voice
-- Live TTS via **edge-tts** with random variants per event and full template engine (includes, conditionals, AND/OR). 7 built-in languages.
-- **Multi-language chat detection** for Twitch / YouTube / in-game chat — each message voiced in its detected language.
-- Hot-reloadable voiceline files (`en.toml`, `de.toml`, …) with `add` / `replace` / `replace = []` semantics.
-- Optional **AI-generated voice lines** — swap the static template system for on-the-fly text from `kimi -p` or `claude -p` (opt-in, `voice_engine` setting). Falls back to the static line if the CLI is missing, slow, or errors out. Rapid event bursts (e.g. FSS scans) are grouped into a single AI call.
-- Optional **personality file** shapes the AI's tone (`config/personality/default.toml`), mirroring the voiceline override pattern.
-- Optional **ambient commentary** — NOVA occasionally remarks on your situation unprompted, every 180–360 s (random, togglable), when AI voice is enabled.
+v1 (NOVA fork + EDMC shim + 1:1 overlay host + terminal mirror +
+per-plugin settings + launcher) is implemented in `red_navigator/`
+with headless replay/parity tests under `tests/` (see
+`tests/parity/` and `scripts/verify_parity.py`). Full suite:
+`.venv/bin/python -m pytest tests/ -q`.
 
-### Exploration
-- Bio-scan assistant: sample distances, compass bearings, scan completion, first-footfall bonus detection.
-- Bio value range estimates from FSS data (predicted genera) → DSS-confirmed ranges → actual scan values.
-- Frontier-formula body values with full DSS multiplier chain (first-discovered, first-mapped, efficiency, Odyssey footfall).
-- High-G body warning at ≥ 1.5 G (single) and ≥ 3 G (repeat + orange border flash).
+## Roadmap
 
-### Navigation & Maps
-- **Route** panel with per-waypoint star class, scoopable flag, distances, and live EDSM body/bio totals.
-- Offline **neutron route planner** (Spansh dump, daily refresh).
-- Fleet-carrier lookup (Spansh API, opt-in).
-- Galaxy map (Braille, with route waypoints) — system / regional / galactic zoom.
-
-### Terminal UI
-- 14-mode **Situational** panel, auto-switching by context (`a` to lock). Mission panel groups by destination with cargo totals, type badges, reward column, wing/influence markers, and massacre kill-stack bars with per-threshold milestones.
-- In-app **Settings overlay** (`s` key) — every key, live-applied.
-- **Custom themes** — TOML-based colour theming with two built-in palettes (Default, Sakura Night) and full user customisation.
-- Hot-reload for `config.toml` and voiceline files within ~2 s.
-- Power-distribution pips, two-column system info, color-coded event + chat logs.
-
-### Integrations
-- **Twitch** chat (anonymous, no API key) → panel + TTS.
-- **YouTube** live chat (anonymous, no API key) → panel + TTS.
-- **EDSM** nightly dumps (systems / stations / Power Play) stored locally.
-- **Spansh** API for fleet carriers (opt-in).
-- Stream **overlay**: per-field `.txt` files for OBS / Streamlabs.
-- Automatic **screenshot** rename + BMP→PNG conversion.
-- Automatic **.binds** file backups (last 5 kept).
-
----
-
-## Configuration
-
-The config file is created automatically on first launch. Press **`s`** inside NOVA for the in-app settings overlay — the easiest way to change anything without editing files.
-
-| Install type | Path |
-|-------------|------|
-| Portable (launcher) — Linux | `<script folder>/config/config.toml` |
-| Portable (launcher) — Windows | `<script folder>\config\config.toml` |
-| System install — Linux | `~/.config/nova/config.toml` |
-| System install — Windows | `%USERPROFILE%\.config\nova\config.toml` |
-
-See **[docs/Settings.md](docs/Settings.md)** for every key, including AI-generated voice, personality, and ambient commentary.
-
----
-
-## Keyboard shortcuts (summary)
-
-| Key | Action |
-|-----|--------|
-| `q` / `Esc` | Quit |
-| `s` | Open Settings overlay |
-| `?` | Help & About screen |
-| `Tab` / `Shift+Tab` | Cycle focused panel forward/backward (1→6) |
-| `a` | Toggle auto-switching |
-| `↑` / `↓` / `k` / `j` | Scroll situational panel (`MAP`: cycle sub-view) |
-| `←` / `→` | Cycle situational panel modes |
-| `PgUp` / `PgDn` | Scroll focused panel (or situational when none focused) |
-| `Home` / `End` | Jump to top / bottom of focused panel |
-| `Enter` | Engineers: open detail / return to list |
-| `n` | Neutron route destination input (Neutron mode only) |
-| `+` / `=` / `−` | Volume ±5 % |
-| `m` / `g` / `t` / `y` / `p` | Mute all / chat / twitch / youtube / all-chat |
-
-Full list with context-specific bindings in **[docs/Usage.md](docs/Usage.md)**.
-
----
-
-## TTS languages
-
-| Language | Default voice |
-|----------|---------------|
-| English | `en-GB-SoniaNeural` |
-| German | `de-DE-KatjaNeural` |
-| French | `fr-FR-DeniseNeural` |
-| Italian | `it-IT-ElsaNeural` |
-| Spanish | `es-ES-ElviraNeural` |
-| Portuguese | `pt-PT-RaquelNeural` |
-| Russian | `ru-RU-SvetlanaNeural` |
-
-Change per-language voice in `config.toml` (`tts_voice_en = en-US-GuyNeural` etc.) or via the Settings overlay. `edge-tts --list-voices` shows every available voice.
-
----
-
-## Requirements
-
-- **Python 3.11+** (3.12 / 3.13 / 3.14 tested)
-- **Linux, macOS, Windows** — all first-class
-- For Linux on Steam/Proton the journal directory is auto-detected via the default Steam path, the Flatpak Steam path, and Heroic Games Launcher prefixes
+- **Phase 2 — EDNA behaviour.** Explicitly not in v1 beyond leaving
+  room for another integration module.
+- **Phase 3 — Discord Rich Presence** (VeeLume /
+  Elite-Dangerous-Rich-Presence style). After EDNA.
+- No browser dependency and no always-on heavyweight renderer are
+  standing constraints: loading plugins must cost less than the stack
+  they replace.
 
 ---
 
 ## License
 
 MIT — see `LICENSE`.
+
+Original NOVA copyright (Nicolas Kerscher, 2025) is retained there
+alongside the RED Navigator copyright (Razwerkz, 2026), per the
+upstream MIT terms.
