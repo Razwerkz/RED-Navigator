@@ -226,7 +226,7 @@ def make_event_sink(
 
 
 #: Default seed for the RED action registry: ``(action id, label, default
-#: key)`` per action. ``route.resume`` has **no** single-key default —
+#: key)`` per action. ``route.resume`` defaults to **Numpad+** (``numpad_add``),
 #: its default trigger is the bare double-Shift gesture (see
 #: :mod:`red_navigator.actions.gestures`); the settings menu renders the
 #: ``None`` key as ``unbound``. Every other entry preserves the exact
@@ -234,7 +234,7 @@ def make_event_sink(
 #: canonical ``plus``/``minus`` names Textual delivers ("=" stays a
 #: legacy alias — see the ``on_key`` volume branches).
 _DEFAULT_ACTIONS: tuple[tuple[str, str, str | None], ...] = (
-    ("route.resume", "Resume route (Shift ×2)", None),
+    ("route.resume", "Resume route (Numpad+)", "numpad_add"),
     ("nova.help", "Help", "question_mark"),
     ("nova.quit", "Quit", "q"),
     ("nova.escape", "Clear focus / quit", "escape"),

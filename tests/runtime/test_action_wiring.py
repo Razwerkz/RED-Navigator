@@ -57,11 +57,11 @@ def test_migrated_defaults_cover_global_single_keys():
         assert registry.resolve(key) is not None, key
 
 
-def test_resume_has_no_single_key_default():
+def test_resume_defaults_to_numpad_add():
     from red_navigator.actions import registry
 
     assert registry.get("route.resume") is not None
-    assert registry.get("route.resume")["key"] is None
+    assert registry.get("route.resume")["key"] == "numpad_add"
 
 
 def _wire_with_fakes(route_entries):
