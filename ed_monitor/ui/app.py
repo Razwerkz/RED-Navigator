@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import logging
 import queue
 import threading
 import time
@@ -24,6 +25,9 @@ from .panels import (
     SituationalPanel,
     SystemPanel,
 )
+
+
+_log = logging.getLogger("ed_monitor.ui.app")
 
 
 class HelpScreen(Screen):
@@ -209,6 +213,152 @@ class NeutronInputScreen(Screen):
         if event.key == "escape":
             event.stop()
             self.app.pop_screen()
+
+
+def _red_action_known(action_id: str) -> bool:
+    """Return True when the RED action registry owns ``action_id``.
+
+    The legacy ``on_key`` branches below consult this so a migrated key
+    keeps working when RED never registered it (standalone NOVA, empty
+    registry) while staying silent once the registry owns the action —
+    which is what makes rebinding/unbinding effective. ``when``
+    predicates are deliberately ignored here: a registered-but-
+    currently-disabled action still owns its key (its legacy branch
+    would no-op anyway). Never raises.
+    """
+    try:
+        from red_navigator.actions import registry as _registry
+        return any(
+            a.get("id") == action_id for a in _registry.list_actions()
+        )
+    except Exception:
+        return False
+
+
+# ── Migrated single-key actions (Task 5) ──────────────────────────────────
+# Each ``_key_*`` helper holds the exact legacy ``on_key`` body for one
+# migrated binding, operating on a duck-typed app (``NOVAApp``). The
+# legacy branches below call these (guarded by ``_red_action_known``)
+# and ``red_navigator.app.wire_actions`` wraps the same helpers in
+# zero-arg registry handlers — a single source of truth for both paths.
+
+def _key_help(app: "NOVAApp") -> None:
+    app.push_screen(HelpScreen())
+
+
+def _key_quit(app: "NOVAApp") -> None:
+    app.exit()
+
+
+def _key_escape(app: "NOVAApp") -> None:
+    # Clear panel focus if any, otherwise quit
+    if app._focused_panel != 0:
+        app._set_focus(0)
+    else:
+        app.exit()
+
+
+def _key_focus(app: "NOVAApp", n: int) -> None:
+    app._set_focus(n)
+
+
+def _key_focus_next(app: "NOVAApp") -> None:
+    n = app._focused_panel
+    if n == 0:
+        app._set_focus(1)
+    else:
+        app._set_focus((n % 6) + 1)
+
+
+def _key_toggle_chat_tts(app: "NOVAApp") -> None:
+    with app._lock:
+        app._state.chat_tts_muted = not app._state.chat_tts_muted
+
+
+def _key_toggle_twitch_tts(app: "NOVAApp") -> None:
+    with app._lock:
+        app._state.twitch_tts_muted = not app._state.twitch_tts_muted
+
+
+def _key_toggle_youtube_tts(app: "NOVAApp") -> None:
+    with app._lock:
+        app._state.youtube_tts_muted = not app._state.youtube_tts_muted
+
+
+def _key_toggle_all_chat_tts(app: "NOVAApp") -> None:
+    with app._lock:
+        # If all three are muted → unmute all; otherwise mute all.
+        all_muted = (
+            app._state.chat_tts_muted
+            and app._state.twitch_tts_muted
+            and app._state.youtube_tts_muted
+        )
+        app._state.chat_tts_muted    = not all_muted
+        app._state.twitch_tts_muted  = not all_muted
+        app._state.youtube_tts_muted = not all_muted
+
+
+def _key_settings(app: "NOVAApp") -> None:
+    if app._cfg is not None:
+        app.push_screen(SettingsScreen(app._cfg))
+    # NOTE: the legacy branch ended with `return`, a no-op at the tail of
+    # on_key (nothing follows the chain); omitted here.
+
+
+def _key_toggle_auto_lock(app: "NOVAApp") -> None:
+    app.query_one(SituationalPanel).toggle_auto_lock()
+
+
+def _key_mute(app: "NOVAApp") -> None:
+    with app._vol_lock:
+        with app._lock:
+            if app._state.muted:
+                # Unmute: restore pre-mute volume
+                app._volume[0] = app._state.pre_mute_volume
+                app._state.volume = app._volume[0]
+                app._state.muted = False
+            else:
+                # Mute: save current volume, set to 0
+                app._state.pre_mute_volume = app._volume[0]
+                app._state.muted = True
+                app._volume[0] = 0
+                app._state.volume = 0
+
+
+def _key_volume_up(app: "NOVAApp") -> None:
+    with app._vol_lock:
+        with app._lock:
+            if app._state.muted:
+                # Unmute on volume-up
+                app._state.muted = False
+                app._state.pre_mute_volume = app._volume[0]
+            app._volume[0] = min(app._volume[0] + 5, 100)
+            app._state.volume = app._volume[0]
+
+
+def _key_volume_down(app: "NOVAApp") -> None:
+    with app._vol_lock:
+        with app._lock:
+            app._volume[0] = max(app._volume[0] - 5, 0)
+            app._state.volume = app._volume[0]
+
+
+def _key_engineers_enter(app: "NOVAApp") -> None:
+    sit = app.query_one(SituationalPanel)
+    if sit._active == "engineers":
+        if sit._eng_detail:
+            sit.eng_back()
+        else:
+            sit.eng_select()
+
+
+def _key_neutron_input(app: "NOVAApp") -> None:
+    # Open neutron route input screen
+    sit = app.query_one(SituationalPanel)
+    if sit._active == "neutron" or sit._mode == "neutron":
+        with app._lock:
+            cur = app._state.system
+        app.push_screen(NeutronInputScreen(app._neutron_q, cur))
 
 
 class NOVAApp(App):
@@ -696,6 +846,57 @@ class NOVAApp(App):
         elif n == 6:
             self.query_one(ChatLogPanel).scroll_chat(delta)
 
+    def _dispatch_red_action(self, event: events.Key) -> bool:
+        """Consult gestures, then the RED action registry. True if handled.
+
+        Never raises. Input-focus typing can never trigger an action:
+        printable keys are already stopped by the focused ``Input``
+        (verified against Textual 8.2.8 ``Input._on_key``), and this
+        method additionally skips gesture+registry dispatch while an
+        ``Input`` holds focus, so non-printable keys that do bubble
+        (e.g. bare Shift) cannot fire bindings mid-typing. The legacy
+        chain below is untouched by that guard — focus semantics there
+        are identical to before.
+        """
+        try:
+            try:
+                typing = isinstance(self.focused, Input)
+            except Exception:
+                typing = False
+            if typing:
+                return False
+            from red_navigator.actions import gestures as _gestures
+            from red_navigator.actions import registry as _registry
+            try:
+                action_id = _gestures.note_key(event.key, time.monotonic())
+            except Exception:
+                action_id = None
+            if action_id is not None:
+                action = _registry.get(action_id)
+                # The gesture is live only while the action has no
+                # single-key binding: capturing a key replaces the
+                # gesture (the menu then shows the key, not unbound).
+                if action is not None and action.get("key") is None:
+                    try:
+                        action["handler"]()
+                    except Exception:
+                        _log.debug("Gesture action %r failed", action_id, exc_info=True)
+                    return True
+                return False
+            try:
+                hit = _registry.resolve(event.key)
+            except Exception:
+                hit = None
+            if hit is not None:
+                try:
+                    hit["handler"]()
+                except Exception:
+                    _log.debug("Registry action %r failed", hit.get("id"), exc_info=True)
+                return True
+        except Exception:
+            _log.debug("RED dispatch failed", exc_info=True)
+        return False
+
     def on_key(self, event: events.Key) -> None:
         # When the settings overlay is active it handles all its own keys.
         # Returning here prevents left/right/up/down from firing panel actions
@@ -705,34 +906,39 @@ class NOVAApp(App):
 
         key = event.key
 
+        # ── RED gesture + registry dispatch (Task 5) ──────────────────────
+        # Gestures, then registry (honoring `when` predicates); True means
+        # handled — skip the legacy chain. Falls through on no match.
+        if self._dispatch_red_action(event):
+            return
+
         if key == "question_mark":
-            self.push_screen(HelpScreen())
+            if not _red_action_known("nova.help"):
+                _key_help(self)
             return
 
         if key == "q":
-            self.exit()
+            if not _red_action_known("nova.quit"):
+                _key_quit(self)
 
         elif key == "escape":
             # Clear panel focus if any, otherwise quit
-            if self._focused_panel != 0:
-                self._set_focus(0)
-            else:
-                self.exit()
+            if not _red_action_known("nova.escape"):
+                _key_escape(self)
 
         # ── Panel focus: number keys 1-6 ──────────────────────────────────────
         elif key in ("1", "2", "3", "4", "5", "6"):
-            self._set_focus(int(key))
+            if not _red_action_known(f"nova.focus.{key}"):
+                _key_focus(self, int(key))
 
         elif key == "0":
-            self._set_focus(0)
+            if not _red_action_known("nova.focus.clear"):
+                _key_focus(self, 0)
 
         # ── Tab: cycle focused panels (1→2→3→…→6→1) ──────────────────────────
         elif key == "tab":
-            n = self._focused_panel
-            if n == 0:
-                self._set_focus(1)
-            else:
-                self._set_focus((n % 6) + 1)
+            if not _red_action_known("nova.focus.next"):
+                _key_focus_next(self)
 
         elif key == "shift+tab":
             n = self._focused_panel
@@ -847,80 +1053,51 @@ class NOVAApp(App):
                 self.query_one(ChatLogPanel).jump_bottom()
 
         elif key == "g":
-            with self._lock:
-                self._state.chat_tts_muted = not self._state.chat_tts_muted
+            if not _red_action_known("chat.game.tts"):
+                _key_toggle_chat_tts(self)
 
         elif key == "t":
-            with self._lock:
-                self._state.twitch_tts_muted = not self._state.twitch_tts_muted
+            if not _red_action_known("chat.twitch.tts"):
+                _key_toggle_twitch_tts(self)
 
         elif key == "y":
-            with self._lock:
-                self._state.youtube_tts_muted = not self._state.youtube_tts_muted
+            if not _red_action_known("chat.youtube.tts"):
+                _key_toggle_youtube_tts(self)
 
         elif key == "p":
-            with self._lock:
-                # If all three are muted → unmute all; otherwise mute all.
-                all_muted = (
-                    self._state.chat_tts_muted
-                    and self._state.twitch_tts_muted
-                    and self._state.youtube_tts_muted
-                )
-                self._state.chat_tts_muted    = not all_muted
-                self._state.twitch_tts_muted  = not all_muted
-                self._state.youtube_tts_muted = not all_muted
+            if not _red_action_known("chat.all.tts"):
+                _key_toggle_all_chat_tts(self)
 
         elif key == "s":
-            if self._cfg is not None:
-                self.push_screen(SettingsScreen(self._cfg))
+            if not _red_action_known("nova.settings"):
+                _key_settings(self)
             return
 
         elif key == "a":
-            self.query_one(SituationalPanel).toggle_auto_lock()
+            if not _red_action_known("sit.auto.lock"):
+                _key_toggle_auto_lock(self)
 
         elif key == "m":
-            with self._vol_lock:
-                with self._lock:
-                    if self._state.muted:
-                        # Unmute: restore pre-mute volume
-                        self._volume[0] = self._state.pre_mute_volume
-                        self._state.volume = self._volume[0]
-                        self._state.muted = False
-                    else:
-                        # Mute: save current volume, set to 0
-                        self._state.pre_mute_volume = self._volume[0]
-                        self._state.muted = True
-                        self._volume[0] = 0
-                        self._state.volume = 0
+            if not _red_action_known("audio.mute"):
+                _key_mute(self)
 
         elif key in ("plus", "equal", "+", "="):
-            with self._vol_lock:
-                with self._lock:
-                    if self._state.muted:
-                        # Unmute on volume-up
-                        self._state.muted = False
-                        self._state.pre_mute_volume = self._volume[0]
-                    self._volume[0] = min(self._volume[0] + 5, 100)
-                    self._state.volume = self._volume[0]
+            # The registry owns one canonical binding ("plus"); "=" is the
+            # same physical key on most layouts, so the alias stays in the
+            # legacy chain (unguarded) to preserve the exact current keys.
+            # (Documented wart: unbinding vol.up leaves "=" live.)
+            if key != "plus" or not _red_action_known("audio.vol.up"):
+                _key_volume_up(self)
 
         elif key in ("minus", "-"):
-            with self._vol_lock:
-                with self._lock:
-                    self._volume[0] = max(self._volume[0] - 5, 0)
-                    self._state.volume = self._volume[0]
+            if key != "minus" or not _red_action_known("audio.vol.down"):
+                _key_volume_down(self)
 
         elif key == "enter":
-            sit = self.query_one(SituationalPanel)
-            if sit._active == "engineers":
-                if sit._eng_detail:
-                    sit.eng_back()
-                else:
-                    sit.eng_select()
+            if not _red_action_known("sit.engineers.enter"):
+                _key_engineers_enter(self)
 
         elif key == "n":
             # Open neutron route input screen
-            sit = self.query_one(SituationalPanel)
-            if sit._active == "neutron" or sit._mode == "neutron":
-                with self._lock:
-                    cur = self._state.system
-                self.push_screen(NeutronInputScreen(self._neutron_q, cur))
+            if not _red_action_known("neutron.input"):
+                _key_neutron_input(self)

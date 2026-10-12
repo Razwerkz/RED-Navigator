@@ -96,6 +96,37 @@ def resolve(key: str) -> dict | None:
     return None
 
 
+def get(id: str) -> dict | None:
+    """Return the registered action ``id``, or ``None``.
+
+    Unlike :func:`resolve` (key lookup), this is a by-id lookup for
+    callers that already know the action (e.g. gesture dispatch for
+    actions with no single-key binding). The ``when`` predicate is
+    evaluated exactly as in :func:`resolve`: an action whose predicate
+    returns False (or raises) yields ``None``.
+    """
+    with _lock:
+        action = _actions.get(id)
+        snapshot = dict(action) if action is not None else None
+    if snapshot is None:
+        return None
+    predicate = snapshot["when"]
+    if predicate is not None:
+        try:
+            if not predicate():
+                return None
+        except Exception:
+            _log.debug("when predicate for %r raised; skipping", id, exc_info=True)
+            return None
+    return {
+        "id": snapshot["id"],
+        "label": snapshot["label"],
+        "key": snapshot["key"],
+        "default": snapshot["default"],
+        "handler": snapshot["handler"],
+    }
+
+
 def list_actions() -> list[dict]:
     """Return ``{id, label, key, default}`` per registered action."""
     with _lock:
