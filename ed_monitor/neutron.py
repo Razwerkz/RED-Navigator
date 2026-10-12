@@ -86,6 +86,22 @@ def _worker(q: queue.Queue, state: AppState, lock: threading.RLock) -> None:
 
 # ── Spansh API ─────────────────────────────────────────────────────────────────
 
+def _hops_to_route(jumps: list) -> list[dict]:
+    """Normalise Spansh `system_jumps` entries to {system, neutron, distance, jumps}."""
+    route = []
+    for j in jumps:
+        if not isinstance(j, dict):
+            continue
+        dist = float(j.get("distance_jumped") or j.get("distance") or 0.0)
+        route.append({
+            "system":   j.get("system", "?"),
+            "neutron":  bool(j.get("neutron_star", False)),
+            "distance": dist,
+            "jumps":    int(j.get("jumps") or 0),  # regular hops to reach this waypoint
+        })
+    return route
+
+
 def _spansh_route(src: str, dst: str, jump_range: float) -> Optional[list[dict]]:
     """Submit neutron route job to Spansh, poll until done.
     Returns list of {system, neutron, distance} or None on failure."""
@@ -133,15 +149,7 @@ def _spansh_route(src: str, dst: str, jump_range: float) -> Optional[list[dict]]
         if status == "ok":
             jumps = (data.get("result") or {}).get("system_jumps") or []
             _log.info(f"Spansh done: {len(jumps)} hops")
-            route = []
-            for j in jumps:
-                dist = float(j.get("distance_jumped") or j.get("distance") or 0.0)
-                route.append({
-                    "system":   j.get("system", "?"),
-                    "neutron":  bool(j.get("neutron_star", False)),
-                    "distance": dist,
-                    "jumps":    int(j.get("jumps") or 0),  # regular hops to reach this waypoint
-                })
+            route = _hops_to_route(jumps)
             return route or None
         elif status == "error":
             _log.warning(f"Spansh error: {data}")
@@ -149,3 +157,128 @@ def _spansh_route(src: str, dst: str, jump_range: float) -> Optional[list[dict]]
 
     _log.warning(f"Spansh timed out after {_SPANSH_TIMEOUT}s")
     return None
+
+
+# ── Live plotting with offline fallback ──────────────────────────────────────
+#
+# plot_neutron_live() tries the keyless live Spansh neutron router first with an
+# explicit timeout, then falls back to the offline neutron-dump path on any
+# failure. NOTE: this function blocks on network I/O — callers must execute it
+# off the UI thread (e.g. the nova-neutron worker or a background future).
+
+_DEFAULT_LIVE_RANGE = 30.0   # ly; the Spansh router needs a jump range and this
+                             # entry point carries no ship state, so use a sane default.
+_POLL_STEP = 2.0             # seconds between live result polls
+
+
+def _fetch_live(origin: str, destination: str, timeout_s: float) -> dict:
+    """Perform the single bounded live request against the Spansh neutron router.
+
+    Submits the route job then polls until done, all within `timeout_s`.
+    Returns {"route": [hop, ...]}. May raise (including TimeoutError);
+    callers (plot_neutron_live) translate any failure into offline fallback.
+    No API key required — the Spansh neutron router is keyless.
+    """
+    budget = max(0.1, float(timeout_s))
+    deadline = time.monotonic() + budget
+
+    params = urllib.parse.urlencode({
+        "from":       origin,
+        "to":         destination,
+        "efficiency": 60,
+        "range":      f"{_DEFAULT_LIVE_RANGE:.2f}",
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        _SPANSH_ROUTE_URL,
+        data=params,
+        headers={
+            "User-Agent":   USER_AGENT,
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=min(budget, TIMEOUT_MEDIUM)) as resp:
+        data = json.loads(resp.read())
+    job_id = data.get("job") if isinstance(data, dict) else None
+    if not job_id:
+        raise ValueError(f"unexpected live submit response: {data!r:.120}")
+
+    poll_url = _SPANSH_RESULTS_URL.format(job_id)
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"live Spansh neutron route {origin} → {destination} "
+                f"timed out after {timeout_s:g}s"
+            )
+        time.sleep(min(_POLL_STEP, remaining))
+        try:
+            req = urllib.request.Request(poll_url, headers={"User-Agent": USER_AGENT})
+            with urllib.request.urlopen(req, timeout=min(remaining, TIMEOUT_SHORT)) as resp:
+                data = json.loads(resp.read())
+        except Exception as exc:
+            _log.debug(f"Spansh live poll error: {exc}")
+            continue
+
+        status = data.get("status", "") if isinstance(data, dict) else ""
+        if status == "ok":
+            jumps = (data.get("result") or {}).get("system_jumps") or []
+            return {"route": _hops_to_route(jumps)}
+        elif status == "error":
+            raise RuntimeError(f"live Spansh router error: {data!r:.160}")
+
+
+def _plot_offline(origin: str, destination: str) -> tuple[Optional[list[dict]], str]:
+    """Offline neutron-dump fallback path.
+
+    Returns (route | None, reason). No local neutron-star dump cache is wired
+    into the plotter yet, so this seam currently reports unavailability; it
+    exists so the systems_neutron dump can be plugged in without touching the
+    live path or its callers.
+    """
+    _ = (origin, destination)
+    return None, "no cached offline neutron dump available"
+
+
+def plot_neutron_live(origin: str, destination: str, *, timeout_s: float = 15.0) -> dict:
+    """Plot a neutron route, live Spansh first with offline-dump fallback.
+
+    Blocks on network I/O — callers must execute off the UI thread.
+    Returns {ok, route: list | None, source: "live" | "offline", notice: str}
+    where `notice` always explains which source served the route.
+    """
+    try:
+        payload = _fetch_live(origin, destination, timeout_s)
+        route = payload.get("route") if isinstance(payload, dict) else None
+        if not route:
+            raise ValueError("live Spansh response contained no route")
+        return {
+            "ok":     True,
+            "route":  route,
+            "source": "live",
+            "notice": (
+                f"Live Spansh neutron route {origin} → {destination}: "
+                f"{len(route)} waypoint(s)."
+            ),
+        }
+    except Exception as exc:
+        route, reason = _plot_offline(origin, destination)
+        if route:
+            return {
+                "ok":     True,
+                "route":  route,
+                "source": "offline",
+                "notice": (
+                    f"Live Spansh request failed ({exc}); "
+                    f"fallback to offline dump ({reason}): {len(route)} waypoint(s)."
+                ),
+            }
+        return {
+            "ok":     False,
+            "route":  None,
+            "source": "offline",
+            "notice": (
+                f"Live Spansh request failed ({exc}); "
+                f"fallback to offline dump: {reason}."
+            ),
+        }
