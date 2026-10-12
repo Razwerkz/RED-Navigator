@@ -49,6 +49,10 @@ _OVERLAY_CHILD_NAMES = (
     "ModernOverlay",
 )
 
+#: Module-global active session set by :func:`start` and cleared by
+#: :func:`stop` (see :func:`stop_active` for the pre-exec use).
+_active: Session | None = None
+
 
 def resolve_overlay_dir(plugin_dir: str, *, override: str | None = None) -> str | None:
     """Resolve the single-plugin dir to hand to overlay ``host.start()``.
@@ -158,6 +162,7 @@ def start(
     Never raises for plugin/overlay problems (bad plugins are skipped
     with a log; overlay failure degrades to terminal-only).
     """
+    global _active
     from red_navigator.edmc_compat import loader
     from red_navigator.runtime import fanout
     from red_navigator.settings_ui import host_panel
@@ -218,6 +223,7 @@ def start(
 
     fanout.set_enabled(True)
     sess._running = True
+    _active = sess
     _log.info(
         "RED session started: %d plugin(s) from %s (overlay=%s)",
         len(sess._plugins), plugin_dir, overlay_path,
@@ -231,9 +237,15 @@ def stop(s: Session | None) -> None:
     Idempotent; ``None`` or an already-stopped session is a no-op. Never
     raises.
     """
+    global _active
     if s is None or not isinstance(s, Session):
         return
     if not s._running and not s._plugins:
+        try:
+            if _active is s:
+                _active = None
+        except Exception:
+            pass
         return
 
     from red_navigator.edmc_compat import loader
@@ -268,4 +280,37 @@ def stop(s: Session | None) -> None:
         except Exception:
             _log.debug("fanout disable failed", exc_info=True)
         s._running = False
+        try:
+            if _active is s:
+                _active = None
+        except Exception:
+            pass
         _log.info("RED session stopped")
+
+
+def stop_active() -> bool:
+    """Stop the module-global active session set by :func:`start`.
+
+    Stops and clears the active session (``port.json`` owner released
+    via the host path inside :func:`stop`, so a settings-triggered
+    re-exec never leaves a stale owner behind). Never raises; returns
+    False when no session is active.
+    """
+    global _active
+    try:
+        sess = _active
+    except Exception:
+        return False
+    if sess is None:
+        return False
+    try:
+        stop(sess)
+    except Exception:
+        _log.debug("stop_active failed", exc_info=True)
+    finally:
+        try:
+            if _active is sess:
+                _active = None
+        except Exception:
+            pass
+    return True

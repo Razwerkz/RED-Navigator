@@ -407,6 +407,34 @@ def publish(payload: dict) -> bool:
     return False
 
 
+def notify_dashboard(data: dict, cmdr: str = "") -> bool:
+    """Deliver Status.json ``data`` to the hosted overlay's dashboard hook.
+
+    Journal-shaped payloads reach the overlay via :func:`publish`, but
+    dashboard state (Flags/Pips/...) never matches that gate — so its
+    ``dashboard_entry`` (profile ship/wing/SRV/on-foot contexts) would
+    never fire, unlike real EDMC. This forwards ``data`` through
+    :func:`loader.call_dashboard` with the given commander context.
+    Exception-contained (logs, never raises); True only when the hook
+    was present and did not raise. :func:`publish` semantics unchanged.
+    """
+    with _lock:
+        plugin = _plugin
+    if plugin is None or not isinstance(data, dict):
+        return False
+    try:
+        from red_navigator.edmc_compat import loader
+
+        try:
+            cmdr_str = str(cmdr or "")
+        except Exception:
+            cmdr_str = ""
+        return bool(loader.call_dashboard(plugin, cmdr_str, False, dict(data)))
+    except Exception:
+        _log.debug("Dashboard forward failed", exc_info=True)
+        return False
+
+
 def last_port() -> int:
     """Return the current broadcaster port (0 when not started)."""
     with _lock:

@@ -231,6 +231,12 @@ def dashboard_entry(data: dict) -> None:
             host.publish(dict(data))
         except Exception:
             _log.debug("dashboard_entry overlay publish failed", exc_info=True)
+        try:
+            from red_navigator.overlay_host import host as _dash_host
+
+            _dash_host.notify_dashboard(dict(data), cmdr)
+        except Exception:
+            _log.debug("dashboard_entry overlay dashboard failed", exc_info=True)
         # Status.json polls (~1 Hz) are raw dashboard state (Flags/Pips/...)
         # with no overlay-shaped keys; mirroring them would flood the Event
         # Log with full JSON dumps (mirror.to_textual falls through to

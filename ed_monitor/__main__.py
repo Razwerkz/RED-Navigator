@@ -131,6 +131,39 @@ def _detect_initial_commander(journal_dir: Path) -> str:
         return ""
 
 
+def _red_reexec_argv() -> list[str] | None:
+    """Return the RED launcher re-exec argv, or None when unavailable.
+
+    Pure selection seam (no exec): prefers
+    :func:`red_navigator.app.reexec_argv` when RED is importable; None
+    on ANY failure so the caller falls through to the legacy behavior.
+    """
+    try:
+        from red_navigator import app as _red_app
+
+        argv = _red_app.reexec_argv()
+        if isinstance(argv, (list, tuple)) and argv:
+            return list(argv)
+        return None
+    except Exception:
+        return None
+
+
+def _restart_exec_argv() -> list[str]:
+    """Return the argv a settings-triggered restart would exec (no exec).
+
+    Test seam: RED launcher argv when available, else the legacy NOVA
+    selection (``-m ed_monitor`` for ``__main__.py`` launches, direct
+    script exec otherwise).
+    """
+    red_argv = _red_reexec_argv()
+    if red_argv:
+        return red_argv
+    if sys.argv[0].endswith("__main__.py"):
+        return [sys.executable, "-m", "ed_monitor"]
+    return list(sys.argv)
+
+
 def main() -> None:
     cfg = config.load()
     debug_log.setup(cfg.debug_log, config.logs_dir())
@@ -339,6 +372,21 @@ def main() -> None:
 
     if restart_evt.is_set():
         logging.getLogger("nova").info("Restarting NOVA after settings change")
+        try:
+            from red_navigator.runtime import session as _red_session
+
+            try:
+                _red_session.stop_active()
+            except Exception:
+                pass
+        except Exception:
+            pass
+        try:
+            _red_argv = _red_reexec_argv()
+            if _red_argv:
+                os.execv(_red_argv[0], _red_argv)
+        except Exception:
+            pass
         if sys.argv[0].endswith("__main__.py"):
             os.execv(sys.executable, [sys.executable, "-m", "ed_monitor"])
         else:

@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import logging
+import sys
 from pathlib import Path
 from typing import Any, Callable
 
@@ -109,6 +110,17 @@ def _store_file(red_store: str) -> str:
     if candidate.suffix == ".json":
         return str(candidate)
     return str(candidate / _CONFIG_FILENAME)
+
+
+def reexec_argv() -> list[str]:
+    """Return the argv to re-exec the RED launcher in place.
+
+    Under ``python -m red_navigator.app`` ``sys.argv[0]`` is a
+    non-executable ``app.py``, so NOVA's settings-triggered restart
+    (``os.execv(sys.argv[0], sys.argv)``) fails. Re-exec via the
+    interpreter plus ``-m`` instead, preserving caller args.
+    """
+    return [sys.executable, "-m", "red_navigator.app", *sys.argv[1:]]
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

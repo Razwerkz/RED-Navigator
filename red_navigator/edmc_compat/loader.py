@@ -214,15 +214,21 @@ def dispatch_entry(
         call_journal(plugin, cmdr, is_beta, system, station, entry, state)
 
 
-def call_dashboard(plugin: Any, cmdr: str, is_beta: bool, entry: dict) -> None:
-    """Deliver a Status.json update to ``plugin.dashboard_entry``."""
+def call_dashboard(plugin: Any, cmdr: str, is_beta: bool, entry: dict) -> bool:
+    """Deliver a Status.json update to ``plugin.dashboard_entry``.
+
+    Returns True only when the hook was present and did not raise
+    (False when absent or on plugin error). Never raises.
+    """
     fn = getattr(plugin, "dashboard_entry", None)
     if not callable(fn):
-        return
+        return False
     try:
         fn(cmdr, is_beta, entry)
+        return True
     except Exception:
         _log.exception("dashboard_entry failed")
+        return False
 
 
 def call_cmdr_data(plugin: Any, data: dict, is_beta: bool = False) -> dict:
