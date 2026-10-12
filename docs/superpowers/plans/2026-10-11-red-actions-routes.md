@@ -246,22 +246,24 @@ git commit -m "feat: live Spansh neutron plotting with offline fallback"
 ### Task 5: Launcher wiring, registry migration, default seed
 
 **Files:**
+- Create: `red_navigator/actions/gestures.py`
 - Modify: `red_navigator/app.py` (register resume action, wire collaborators, load bindings at startup)
-- Modify: `ed_monitor/ui/app.py` (consult registry first in `on_key`, keep legacy context chain as fallback)
+- Modify: `ed_monitor/ui/app.py` (consult gestures, then registry, in `on_key`, keep legacy context chain as fallback)
 - Test: `tests/runtime/test_action_wiring.py`
 
 **Interfaces:**
 - Consumes: `registry.register/load_bindings/resolve`, `resume.resume_route`, `clipboard.copy_text`, `host.publish`, `NavRoute` state (read the stored route the same way the route panel does).
-- Produces: `route.resume` action registered with default key `r` (verified free of NOVA bindings at plan time); all pre-existing global single-key NOVA bindings migrated to registry entries with identical defaults; startup calls `load_bindings()` after store wiring.
+- Produces: `route.resume` action registered with **default gesture double-tap Right Shift** (user requirement; VA macro replacement); all pre-existing global single-key NOVA bindings migrated to registry entries with identical defaults; startup calls `load_bindings()` after store wiring; `gestures.note_key(key: str, now: float) -> str | None` (bare-Shift double-tap detector, 400 ms window, returns the action id on double-tap).
 
 - [ ] **Step 1: Write the failing test**
 
 ```python
-def test_resume_registered_with_default_r():
-    from red_navigator.actions import registry
-    import red_navigator.app  # noqa: F401 -- registration side effect
-    hit = registry.resolve("r")
-    assert hit is not None and hit["id"] == "route.resume"
+def test_resume_bound_to_double_shift_gesture():
+    from red_navigator.actions import gestures
+    assert gestures.note_key("shift", 0.0) is None
+    assert gestures.note_key("shift", 0.2) == "route.resume"
+    assert gestures.note_key("shift", 10.0) is None
+    assert gestures.note_key("shift", 11.0) is None  # outside window
 
 def test_migrated_binding_still_resolves():
     from red_navigator.actions import registry
@@ -274,9 +276,9 @@ def test_migrated_binding_still_resolves():
 Run: `pytest tests/runtime/test_action_wiring.py -v`
 Expected: FAIL (no registration yet).
 
-- [ ] **Step 3: Implement wiring in `red_navigator/app.py` and registry-first dispatch in `ed_monitor/ui/app.py`**
+- [ ] **Step 3: Implement wiring in `red_navigator/app.py`, `red_navigator/actions/gestures.py`, and registry-first dispatch in `ed_monitor/ui/app.py`**
 
-`app.main` registers `route.resume` (handler closes over publish/clipboard-copy/`tts_q` speak with the app lock pattern from `make_event_sink`) and migrates each global NOVA binding to a registry entry preserving exact current keys; `on_key` normalizes the event key, resolves via registry (honoring `when` predicates and Input focus behavior identical to today), and falls through to the legacy chain on no match. `load_bindings()` runs at startup after store wiring.
+`app.main` registers `route.resume` (handler closes over publish/clipboard-copy/`tts_q` speak with the app lock pattern from `make_event_sink`) with no single-key default — its default trigger is the double-Shift gesture, shown in the menu as `Shift ×2 (fixed)` and rebindable to any single key via capture (which replaces the gesture). `gestures.note_key` tracks bare Shift taps in a 400 ms window; prefer right-Shift-only if Textual exposes key location, else accept either Shift and document the choice. `on_key` consults gestures, then registry (honoring `when` predicates and Input focus behavior identical to today), then the legacy chain; migrate each global NOVA binding preserving exact current keys. `load_bindings()` runs at startup after store wiring.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
