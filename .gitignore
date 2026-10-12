@@ -80,3 +80,6 @@ service-account*.json
 
 # Python
 .pytest_cache/
+
+# RED Navigator: generated at startup by ensure_theme_files() (user-local copies)
+config/themes/
