@@ -118,6 +118,10 @@ _RATE_OPTIONS = [
 
 _HINT_NAV  = "↑↓ navigate   ← → change   Enter edit text   Esc cancel"
 _HINT_EDIT = "Enter = confirm   Esc = cancel edit"
+_HINT_CAPTURE = "press keys… (Esc cancels)"
+
+# Row-key prefix for Hotkeys section rows (one TextRow per bindable action).
+_HOTKEY_PREFIX = "hotkey:"
 
 
 def _available_themes() -> list[str]:
@@ -297,6 +301,15 @@ class SettingsScreen(Screen):
         self._red_placeholder_ids: set[int] = set()
         self._append_red_rows()
 
+        # ── Hotkeys (additive; upstream rows above unchanged) ─────────────────
+        # One TextRow per bindable action (`label — current key`); activating a
+        # row enters key-capture mode. Best-effort: never breaks upstream init.
+        self._hotkey_rows: list = []
+        self._hotkey_id_of: dict[int, str] = {}
+        self._capturing: bool = False
+        self._capture_row: "TextRow | None" = None
+        self._append_hotkey_rows()
+
     # ── RED Plugins helpers (additive; upstream behavior unchanged) ─────────
 
     def _append_red_rows(self) -> None:
@@ -416,6 +429,126 @@ class SettingsScreen(Screen):
         except Exception:
             pass
 
+    # ── Hotkeys helpers (additive; upstream behavior unchanged) ───────────────
+
+    def _append_hotkey_rows(self) -> None:
+        """Append one TextRow per bindable action to ``self._rows``."""
+        try:
+            from red_navigator.actions import menu as _menu
+            sections = _menu.binding_sections()
+        except Exception:
+            return
+        if not sections:
+            return
+        for section in sections:
+            try:
+                if not isinstance(section, dict):
+                    continue
+                action_id = section.get("id", "")
+                label = section.get("label", action_id)
+                if not isinstance(action_id, str) or not action_id:
+                    continue
+                if not isinstance(label, str) or not label:
+                    label = action_id
+                key = section.get("key")
+                value = str(key) if isinstance(key, str) and key else "unbound"
+                row = TextRow(f"{_HOTKEY_PREFIX}{action_id}", label, value)
+                self._hotkey_rows.append(row)
+                self._hotkey_id_of[id(row)] = action_id
+                self._rows.append(row)
+            except Exception:
+                continue
+
+    def _hotkey_action_of(self, row) -> "str | None":
+        """Return the action id for a Hotkeys row, else None."""
+        try:
+            hit = getattr(self, "_hotkey_id_of", {}).get(id(row))
+            if isinstance(hit, str) and hit:
+                return hit
+            key = getattr(row, "key", "")
+            if isinstance(row, TextRow) and isinstance(key, str) \
+                    and key.startswith(_HOTKEY_PREFIX):
+                action_id = key[len(_HOTKEY_PREFIX):]
+                return action_id or None
+        except Exception:
+            pass
+        return None
+
+    def _enter_hotkey_capture(self, row: TextRow) -> None:
+        """Enter key-capture mode for a Hotkeys row."""
+        self._capturing = True
+        self._capture_row = row
+        try:
+            self.query_one("#settings-hint", Label).update(_HINT_CAPTURE)
+        except Exception:
+            pass
+        self._render_rows()
+
+    def _abort_hotkey_capture(self) -> None:
+        """Leave capture mode with no change."""
+        self._capturing = False
+        self._capture_row = None
+        try:
+            self.query_one("#settings-hint", Label).update(_HINT_NAV)
+        except Exception:
+            pass
+        self._render_rows()
+
+    def _refresh_hotkey_row(self, row: TextRow, action_id: str) -> None:
+        """Re-read a Hotkeys row value from the registry (None → unbound)."""
+        try:
+            from red_navigator.actions import menu as _menu
+            for section in _menu.binding_sections():
+                if isinstance(section, dict) and section.get("id") == action_id:
+                    key = section.get("key")
+                    row.value = str(key) if isinstance(key, str) and key else "unbound"
+                    return
+        except Exception:
+            pass
+
+    def _finish_hotkey_capture(self, key: str) -> None:
+        """Apply a captured key; conflicts stay in capture showing the name."""
+        row = getattr(self, "_capture_row", None)
+        action_id = self._hotkey_action_of(row) if row is not None else None
+        if row is None or action_id is None:
+            self._abort_hotkey_capture()
+            return
+        try:
+            from red_navigator.actions import menu as _menu
+        except Exception:
+            self._abort_hotkey_capture()
+            return
+        try:
+            result = _menu.capture_key(action_id, key)
+        except Exception:
+            result = {"ok": False, "conflict": None}
+        if isinstance(result, dict) and result.get("cancelled"):
+            self._abort_hotkey_capture()
+            return
+        if isinstance(result, dict) and result.get("ok"):
+            self._refresh_hotkey_row(row, action_id)
+            self._capturing = False
+            self._capture_row = None
+            try:
+                self.query_one("#settings-hint", Label).update(_HINT_NAV)
+            except Exception:
+                pass
+            self._render_rows()
+            return
+        conflict = result.get("conflict") if isinstance(result, dict) else None
+        err = result.get("error") if isinstance(result, dict) else None
+        if conflict:
+            msg = f"Key already bound to {conflict} — press another key or Esc"
+        elif err:
+            msg = f"Rebind failed: {err} — press another key or Esc"
+        else:
+            msg = f"Could not bind {key!r} — press another key or Esc"
+        try:
+            self.query_one("#settings-hint", Label).update(msg)
+        except Exception:
+            pass
+        self._render_rows()
+
     # ── Textual lifecycle ────────────────────────────────────────────────────
 
     def on_mount(self) -> None:
@@ -442,13 +575,15 @@ class SettingsScreen(Screen):
         ESC is always active so it can close the editor.
         """
         if action in ("do_up", "do_down", "do_left", "do_right", "do_enter"):
-            return not self._editing
+            return not (self._editing or getattr(self, "_capturing", False))
         return True
 
     # ── BINDING action methods ───────────────────────────────────────────────
 
     def action_do_escape(self) -> None:
-        if self._editing:
+        if getattr(self, "_capturing", False):
+            self._abort_hotkey_capture()
+        elif self._editing:
             self._close_editor()
         else:
             self.app.pop_screen()
@@ -469,17 +604,32 @@ class SettingsScreen(Screen):
         self._cycle(+1)
 
     def action_do_enter(self) -> None:
+        if getattr(self, "_capturing", False):
+            return
         n_rows = len(self._rows)
         if self._cursor == n_rows:
             self._do_save()
         elif self._cursor < n_rows:
             row = self._rows[self._cursor]
+            if self._hotkey_action_of(row) is not None:
+                if isinstance(row, TextRow):
+                    self._enter_hotkey_capture(row)
+                return
             if isinstance(row, TextRow):
                 # RED spec-less placeholder rows are informational only —
                 # never open an editor for them (their hint is discarded on save).
                 if id(row) in getattr(self, "_red_placeholder_ids", set()):
                     return
                 self._open_editor(row)
+
+    def on_key(self, event) -> None:
+        """Route unbound keys to hotkey capture while capturing."""
+        if getattr(self, "_capturing", False):
+            try:
+                event.stop()
+            except Exception:
+                pass
+            self._finish_hotkey_capture(getattr(event, "key", ""))
 
     def _cycle(self, direction: int) -> None:
         n_rows = len(self._rows)
@@ -527,6 +677,9 @@ class SettingsScreen(Screen):
     # ── Rendering ────────────────────────────────────────────────────────────
 
     def _row_text(self, row) -> str:
+        if getattr(self, "_capturing", False) and row is getattr(self, "_capture_row", None):
+            label = f"{row.label}:"
+            return f"{label:<30} [ {_HINT_CAPTURE} ]"
         if isinstance(row, TextRow) and row.key.startswith("panel_"):
             val = row.display_value().strip() or " "
             return f"[{val:<2}] {row.label}"
